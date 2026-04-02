@@ -1,0 +1,22 @@
+{
+    "backend": ["vllm"],
+    "backend_opts": [["H200", "0.11.2"]],
+    "model": ["Meta-Llama-3.1-8B"],
+    "mode": "online",
+    "parallel": ["1:1:8"],
+    "batch": [256],
+    "num_prompt": 1024,
+    "inputs": ["sharegpt@0_0"],
+    "output": "~/.etc",
+    "datapath": "~/.etc",
+    "worker": [],
+    "ross_extra": [
+        {
+            "backend": "vllm",
+            "num_gpus": 8
+        }
+    ],
+    "override":   false,
+    "quiet":      false,
+    "validation": false
+}
