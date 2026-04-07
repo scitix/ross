@@ -1,41 +1,29 @@
-import re
-import os
 import json
-import argparse
-import ast
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any
 
 from tests.load_traces_lmdb import extract_params_from_path, parse_log_file, get_bench_results, get_req_names, calc_execution_timing
-
-PROFILING_KEYS = [
-    "forward_gpu_ms",
-    "iteration_start", "total_time_ms", "post_gpu_ms",
-    "req_ids", "seq_lens", "extend_input_lens"
-]
 
 # ==============================================================================
 # Main execution block
 # ==============================================================================
 
-def load_traces(args, debug = False, skip_timing = True) -> Dict[str, Any]:
-    prank_logs, drank_logs = [], []
-
+def load_traces(args, debug=False) -> Dict[str, Any]:
     rank_logs = list(args["rank_logs"])
     main_prefill_log, main_decode_log = args["prefill_server_log"], args["decode_server_log"]
     main_client_log = args["client_log"]
-
+    print(f"[trace] loading client log: {main_client_log}")
     if not main_client_log:
         raise RuntimeError("No trace logs found.")
-    
+
     prank_logs = [log for log in rank_logs if log.find("prefill") != -1]
     drank_logs = [log for log in rank_logs if log.find("decode") != -1]
 
-    bench_results = get_bench_results(main_client_log)    
+    bench_results = get_bench_results(main_client_log)
     prefill_req_name, text_to_prefill_name, _, prefill_arrivals = get_req_names(main_prefill_log, stage_name="Prefill")
     decode_req_name, _, _, _ = get_req_names(main_decode_log, text_to_prefill_name, stage_name="Decode")
 
-    if debug or not skip_timing:
-        flog = open('log/sglang_disagg_outputs.log', 'w') if debug else None
+    if debug:
+        flog = open('log/sglang_disagg_outputs.log', 'w')
         max_rank_time, max_rank, max_rank_id = 0, 0, 0
         max_decode_data = None
         calculated_dp_rank = {}
@@ -47,8 +35,8 @@ def load_traces(args, debug = False, skip_timing = True) -> Dict[str, Any]:
             dp_rank = params['prefill_dp_rank']
             if dp_rank not in calculated_dp_rank:
                 calculated_dp_rank[dp_rank] = 1
-                rank_timing, _ = calc_execution_timing(dp_rank, data_per_round, prefill_req_name, prefill_arrivals, 'prefill')
-        
+                calc_execution_timing(dp_rank, data_per_round, prefill_req_name, prefill_arrivals, 'prefill')
+
         calculated_dp_rank = {}
         for rank_id, rank in enumerate(drank_logs):
             params = extract_params_from_path(rank, disaggregation_mode=True, stage='decode')
@@ -68,7 +56,7 @@ def load_traces(args, debug = False, skip_timing = True) -> Dict[str, Any]:
 
         max_prefill_data = parse_log_file(log_file=prank_logs[max_rank_id])
         prefill_timing_data, _ = calc_execution_timing(max_rank, max_prefill_data, prefill_req_name, prefill_arrivals, 'prefill', flog)
-        decode_timing_data, _  = calc_execution_timing(max_rank, max_decode_data, decode_req_name, prefill_arrivals, 'decode', flog)
+        decode_timing_data, _ = calc_execution_timing(max_rank, max_decode_data, decode_req_name, prefill_arrivals, 'decode', flog)
         bench_results['staged_timing_data'] = {
             "result_dp_rank": max_rank,
             "prefill_timing_data": prefill_timing_data,

@@ -1,57 +1,118 @@
-### Environment Setup
-pip install xgboost==3.2.0 scikit-learn==1.7.2 matplotlib seaborn
+# ROSS
 
-### [Optional] For New Hardware Platform：Collect Platform Performance
-- The collector uses VLLM to collect platform performance
-pip install cuda-python==12.6 flashinfer-python
-```
-cd <your-path>/SiLLM-OP/test/collector
-python collect.py --backend vllm
-```
-The results are profiled in gemm_perf_vllm_.txt and context_attention_perf.txt.
-- NCCL Statistics
-```
-./collect_comm.sh
-```
-The result file is nccl_perf.txt
-- Manually build SPEC file
-The spec file includes the GPU spec information. Take L40 as an example:
-```
-gpu:
-  mem_bw: 864000000000 # 864GB/s
-  mem_capacity: 51539607552 # 48GB
-  float16_tc_flops: 181050000000000 # 181.05TFLOPS
-  int8_tc_flops: 362000000000000 # 362TFLOPS
-  fp8_tc_flops: 362000000000000 # 362TFLOPS
-  power: 300 # Watt
-```
-- Generate the Performance Feature File
-```
-python extract_platform_features.py --gemm_data=<gemm_file> \
-  --attn_data=<attn_file> --nccl_data=<nccl_file> \
-  --plaform_specs=<spec_file> --output_dir=<outut_path>
-```
-The result yaml file is platform_features.yaml
+ROSS is an offline simulator for LLM inference performance. Given a model, a
+hardware platform, and a workload description, it predicts throughput and
+latency metrics (TTFT, TPOT, ITL) without running a real inference server.
+It supports both SGLang and vLLM backends, colocated and disaggregated
+parallelism, and Pareto-front search over parallel configurations.
 
-Run Simulation
-- ROSS uses ross_config.json to load model configs
+---
+
+## Repository layout
+
 ```
-cd <your-path>/ross
-cat ross_config.json # xgboost model paths
+collector/          Platform profiling scripts + pre-collected hardware profiles
+common/             Shared model/feature/config classes used by both simulators
+ross/               Main simulator package
+  sgl_sim/            SGLang simulator backend
+  vllm_sim/           vLLM simulator backend
+  pareto/             Pareto-front analysis utilities
+  config/             Example JSON config files
+  ross_predict.py     Entry point for offline prediction sweeps
+docs/               Extended documentation
+  bench_config.md     Full config file and CLI reference
+  profiling.md        How to profile a new GPU platform
+modeling/           Pre-trained XGBoost regression models
+test/               Unit and integration tests
 ```
-- The simulation configurations are loaded from a JSON file. Template configs are in ross/config directory.
+
+---
+
+## Quick start
+
+### 1. Install dependencies
+
+```bash
+pip install xgboost==3.2.0 scikit-learn pandas tqdm plotext
 ```
-cat config/test_sglang.json
+
+### 2. Write a config file
+
+Use one of the templates in `ross/config/` as a starting point:
+
+```json
+{
+    "backend":  "sglang",
+    "model":    "Meta-Llama-3.1-70B",
+    "parallel": "1:1:8",
+    "batch":    [64],
+    "num_prompt": 512,
+    "rate":     ["1", "2", "inf"],
+    "inputs":   ["sharegpt@0_0"],
+    "platforms": [{"gpu": "H200", "version": "0.6.6"}],
+    "output":   "~/.etc",
+    "datapath": "~/.etc"
+}
 ```
-- Run simulation with given config file.
-### SGLang Simulation
+
+### 3. Run the simulator
+
+```bash
+cd <repo_root>
+python ross/ross_predict.py --config <your_config.json>
 ```
-python sglang/ross_sgl_predict.py --no-comparison --config=<your-config-file>
+
+Add `--eval` to also load real execution traces and compute prediction error:
+
+```bash
+python ross/ross_predict.py --config <your_config.json> --eval
 ```
-### vLLM Simulation
+
+Add `--get-pareto-front` to search all valid parallel configs and plot the
+Pareto frontier (tokens/s/user vs tokens/s/gpu):
+
+```bash
+python ross/ross_predict.py --config <your_config.json> --get-pareto-front
 ```
-python vllm_sim/ross_vllm_predict.py --no-comparison --config=<your-config-file>
+
+### 4. Save results
+
+```bash
+python ross/ross_predict.py --config <your_config.json> --record-path results.csv
 ```
-Argument Choices:
-- --no-comparsion: only run simulation. By default ROSS will also load the result of real traces.
-- --debug
+
+---
+
+## Key CLI flags
+
+| Flag                      | Description                                  |
+| ------------------------- | -------------------------------------------- |
+| `--config FILE`         | JSON config file (recommended for sweeps)    |
+| `--backend sglang\|vllm` | Simulator backend                            |
+| `--eval`                | Load trace logs and compute prediction error |
+| `--record-path FILE`    | Write metrics to a CSV file                  |
+| `--get-pareto-front`    | Enumerate configs and compute Pareto front   |
+| `--debug`               | Verbose logging                              |
+
+Full reference: [`docs/bench_config.md`](docs/bench_config.md)
+
+---
+
+## Adding a new GPU platform
+
+See [`docs/profiling.md`](docs/profiling.md) for the step-by-step guide on
+collecting kernel and communication performance data for a new hardware target.
+
+Pre-collected profiles for H200 and B200 are already included under
+`collector/`.
+
+---
+
+## Supported configurations
+
+| Dimension   | Options                                                                         |
+| ----------- | ------------------------------------------------------------------------------- |
+| Backend     | SGLang, vLLM                                                                    |
+| Parallelism | Tensor parallel, pipeline parallel, data parallel, disaggregated prefill/decode |
+| Hardware    | H200, B200 (extensible via `collector/`)                                      |
+| Datasets    | ShareGPT, RepoQA, AIME                                                          |

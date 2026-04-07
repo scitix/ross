@@ -138,6 +138,7 @@ class Scheduler:
         In a simulator, OOM typically means:
         1. Accounting error: free_blocks < 0
         2. Impossible request: A single request requires more blocks than total capacity.
+        3. Unschedulable request: scheduler policy can never admit the request.
         """
         # 1. Accounting Consistency
         if self.kv_cache_manager.num_free_blocks < 0:
@@ -165,6 +166,13 @@ class Scheduler:
             if prompt_needed_blocks > total_blocks_capacity:
                     return True, (f"Request {next_req.request_id} prompt requires {prompt_needed_blocks} blocks, "
                                 f"which exceeds total capacity {total_blocks_capacity}.")
+            if next_req.transfer_loaded and self.max_num_batched_tokens < next_req.prompt_tokens:
+                return True, (
+                    f"Request {next_req.request_id} cannot be admitted on decode: "
+                    f"transfer_loaded requires loading full prompt KV "
+                    f"(prompt_tokens={next_req.prompt_tokens}), but "
+                    f"max_num_batched_tokens={self.max_num_batched_tokens}."
+                )
 
         return False, ""
 

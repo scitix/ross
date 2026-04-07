@@ -6,13 +6,6 @@ import argparse
 import ast
 from typing import List, Dict, Any, Optional
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-# sys.path.insert(0, '../test')
-from common.plot import analyze_dp_distribution, plot_and_save_distribution
-from common.utils import resolve_sglang_log_paths
-
 PROFILING_KEYS = [
     "forward_gpu_ms",
     "iteration_start", "total_time_ms", "post_gpu_ms",
@@ -40,10 +33,7 @@ def parse_log_file(log_file: str) -> List[Dict]:
                         data.append(timing_data)
                         continue
                     except (ValueError, SyntaxError, KeyError) as e:
-                        print(log_file)
-                        print(f"Warning: Failed to parse profiler format line {line_num}: {e}")
-                        exit(0)
-        f.close()
+                        raise ValueError(f"Failed to parse profiler format line {line_num} in {log_file}: {e}") from e
         return data
 
     # Pattern for new format: [Profiler: Forward Statistics]: {...}
@@ -195,9 +185,7 @@ def calc_execution_timing(rank, data_per_round, req_name, arrive_time, stage_typ
                 ttlt[r] = result['wall_time']
                 if r not in ttft:
                     ttft[r] = (result['wall_time'] - arrive_time[r]) * 1000
-                    # if (int(r[4:]) - 2) % 256 < 10 and f is not None:
-                    #     print(f"rid={r}, arr_time={arrive_time[r]:.5f}, ttft={(result['wall_time'] - arrive_time[r]):.5f}, batch={len(round_data['req_ids'])}") 
-                    if f is not None:
+                    if f is not None and stage_type != 'decode':
                         print(f"rid={r}, arr_time={arrive_time[r]:.5f}, ttft={(result['wall_time'] - arrive_time[r]):.5f}", file=f)
                 if r not in last_remains:
                     last_remains[r] = round_data['seq_lens'][idx]
@@ -225,13 +213,14 @@ def calc_execution_timing(rank, data_per_round, req_name, arrive_time, stage_typ
 
     return result, avail_tokens
 
-def load_traces(args, debug=False, skip_timing=True):
+def load_traces(args, debug=False):
     rank_logs = list(args["rank_logs"])
     main_server_log = args["server_log"]
     main_client_log = args["client_log"]
 
     if not main_server_log or not main_client_log:
         raise RuntimeError("No trace logs found.")
+    print(f"[trace] loading client log: {main_client_log}")
 
     bench_results = get_bench_results(main_client_log)
 
@@ -255,7 +244,7 @@ def load_traces(args, debug=False, skip_timing=True):
                         req_dispatch_info.append((round_data['iteration_start'], params['dp_rank'], req_name[rid]))
                         dp_rank_count[params['dp_rank']] += 1
 
-    if debug or not skip_timing:
+    if debug:
         flog = open('log/sglang_outputs.log', 'w') if debug else None
         max_rank_time, max_rank = 0, 0
         max_decode_data = None

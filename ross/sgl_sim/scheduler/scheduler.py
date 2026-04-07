@@ -76,6 +76,7 @@ class Scheduler:
 
         self.disaggregation_mode = disaggregation_mode
         self.completed_prefill_reqs: List[Request] = []
+        self.pending_decode_queue: List[Request] = []
 
     def _tokens_needed_next_decode(self, requests: List[Request]):
         return len( [r for r in requests if not r.finished] )
@@ -387,11 +388,35 @@ class Scheduler:
         self.chunked_reqs = [req for req in self.chunked_reqs if not req.finished]
         return batch
 
+    def _try_admit_pending_decode(self) -> None:
+        if self.disaggregation_mode == "decode":
+            return
+        if self.pending_decode_queue and self.running_batch.is_empty():
+            self.running_batch.forward_mode = "decode"
+
+        admitted = []
+        for req in self.pending_decode_queue:
+            total_reqs = self.running_batch.batch_size() + 1
+            headroom = self.reserved_decode_tokens * total_reqs
+            if self.kv_allocator.available_tokens < headroom:
+                break
+            self.running_batch.reqs.append(req)
+            admitted.append(req)
+
+        if admitted:
+            admitted_ids = {req.request_id for req in admitted}
+            self.pending_decode_queue = [
+                req for req in self.pending_decode_queue
+                if req.request_id not in admitted_ids
+            ]
+
     def get_next_batch_to_run(self) -> Optional[Batch]:
         if self.running_queue:
             self.running_batch = self.running_queue.pop(0)
         else:
             self.running_batch = Batch(forward_mode="decode")
+
+        self._try_admit_pending_decode()
 
         # logger.debug(f"[Scheduler] <disagg_mode={self.disaggregation_mode}> get_next_batch_to_run:\nrunning_batch={self.running_batch},\nself.waiting_queue={[r.request_id for r in self.waiting_queue]}")
         # Decode-only path for disaggregated decode worker
@@ -468,14 +493,13 @@ class Scheduler:
             if req.chunk_offset > 0 and self.kv_allocator.available_tokens >= headroom:
                 decode_batch.reqs.append(req)
             else:
-                # [Fix] if cannot decode
-                # 1. release mem
-                self.kv_allocator.free(req.request_id)
-                # 2.reset: next iteration re-prefill
-                req.chunk_offset = 0
-                self.waiting_queue.insert(0, req)
-                logger.debug(f"    [Preempt] req {req.request_id} finished prefill but failed decode admission. Re-queueing.\n"
-                            f"              avail_tokens={self.kv_allocator.available_tokens}, total_req={total_reqs}, head_room={headroom}")
+                # Keep prefill KV resident and wait for decode headroom instead
+                # of restarting prefill from scratch.
+                self.pending_decode_queue.append(req)
+                logger.debug(
+                    f"    [DecodePending] req {req.request_id} finished prefill but failed decode admission.\n"
+                    f"                    avail_tokens={self.kv_allocator.available_tokens}, total_req={total_reqs}, head_room={headroom}"
+                )
 
         if decode_batch.reqs:
             self.running_queue.append(decode_batch)

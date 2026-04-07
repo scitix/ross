@@ -820,6 +820,27 @@ def get_dataset(args, tokenizer):
 
         # Limit the number of requests based on --num-prompts
         input_requests = all_requests_data[: args.num_prompts]
+    elif args.dataset_name == "repoqa":
+        assert not tokenize_prompt
+        input_requests = sample_repoqa_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.repoqa_output_len,
+            max_prompt_len=args.repoqa_prompt_len,
+            max_output_len=args.repoqa_output_len,
+            apply_chat_template=args.apply_chat_template,
+        )
+    elif args.dataset_name == "aime":
+        assert not tokenize_prompt
+        input_requests = sample_aime_requests(
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.aime_output_len,
+            max_prompt_len=args.aime_prompt_len,
+            max_output_len=args.aime_output_len,
+            apply_chat_template=args.apply_chat_template,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
@@ -1594,6 +1615,146 @@ def sample_generated_shared_prefix_requests(
         pickle.dump(input_requests, f)
 
     return input_requests
+
+
+def sample_repoqa_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    max_prompt_len: Optional[int] = 0,
+    max_output_len: Optional[int] = 0,
+    apply_chat_template: bool = False,
+) -> List[DatasetRow]:
+    if fixed_output_len is not None and fixed_output_len < 1:
+        raise ValueError("output_len too small")
+    if not dataset_path:
+        raise ValueError("RepoQA requires --dataset-path")
+
+    if dataset_path.endswith(".jsonl"):
+        with open(dataset_path, encoding="utf-8") as f:
+            dataset = [json.loads(line) for line in f if line.strip()]
+    else:
+        with open(dataset_path, encoding="utf-8") as f:
+            raw_data = json.load(f)
+        dataset = []
+        for _lang, repos in raw_data.items():
+            for repo_item in repos:
+                repo_content = repo_item.get("content", {})
+                needles = repo_item.get("needles", [])
+                if not repo_content or not needles:
+                    continue
+                repo_prompt = "\n\n".join(
+                    f"# File: {filepath}\n{source}"
+                    for filepath, source in repo_content.items()
+                )
+                for needle in needles:
+                    prompt = (
+                        repo_prompt
+                        + "\n\n"
+                        + "Based on the above repository code, find the function "
+                        + f"named `{needle['name']}` described as follows:\n"
+                        + f"{needle.get('description', '')}\n\n"
+                        + "Please provide the complete implementation of this function."
+                    )
+                    dataset.append({"prompt": prompt})
+
+    filtered_dataset: List[DatasetRow] = []
+    for item in dataset:
+        if len(filtered_dataset) == num_requests:
+            break
+
+        prompt = item.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            continue
+
+        if apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
+
+        prompt_len = len(tokenizer.encode(prompt))
+        output_len = fixed_output_len if fixed_output_len is not None else 1024
+        if prompt_len < 4 or output_len < 1:
+            continue
+        if (max_prompt_len > 0 and prompt_len > max_prompt_len) or (
+            max_output_len > 0 and output_len > max_output_len
+        ):
+            continue
+
+        filtered_dataset.append(
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=prompt_len,
+                output_len=output_len if max_output_len == 0 else max_output_len,
+            )
+        )
+
+    print(f"#Num Prompts: {len(filtered_dataset)}")
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
+    return filtered_dataset
+
+
+def sample_aime_requests(
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    max_prompt_len: Optional[int] = 0,
+    max_output_len: Optional[int] = 0,
+    apply_chat_template: bool = False,
+) -> List[DatasetRow]:
+    if fixed_output_len is not None and fixed_output_len < 1:
+        raise ValueError("output_len too small")
+
+    from datasets import load_dataset
+
+    dataset = load_dataset("math-ai/aime26", split="test", streaming=True).shuffle(
+        seed=42
+    )
+
+    filtered_dataset: List[DatasetRow] = []
+    for item in dataset:
+        if len(filtered_dataset) == num_requests:
+            break
+
+        prompt = item["problem"]
+        if apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
+
+        prompt_len = len(tokenizer.encode(prompt))
+        completion = str(item.get("answer", ""))
+        completion_len = len(tokenizer.encode(completion))
+        output_len = completion_len if fixed_output_len is None else fixed_output_len
+        if prompt_len < 4 or output_len < 1:
+            continue
+        if (max_prompt_len > 0 and prompt_len > max_prompt_len) or (
+            max_output_len > 0 and output_len > max_output_len
+        ):
+            continue
+
+        filtered_dataset.append(
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=prompt_len,
+                output_len=output_len if max_output_len == 0 else max_output_len,
+            )
+        )
+
+    print(f"#Num Prompts: {len(filtered_dataset)}")
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
+    return filtered_dataset
 
 
 async def get_request(
@@ -2551,6 +2712,32 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    repoqa_group = parser.add_argument_group("repoqa dataset arguments")
+    repoqa_group.add_argument(
+        "--repoqa-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the output length from the RepoQA dataset.",
+    )
+    repoqa_group.add_argument(
+        "--repoqa-prompt-len",
+        type=int,
+        default=None,
+        help="The prompt length of the model for the RepoQA dataset. Requests longer than the prompt length will be dropped.",
+    )
+    aime_group = parser.add_argument_group("aime dataset arguments")
+    aime_group.add_argument(
+        "--aime-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the output length from the AIME dataset.",
+    )
+    aime_group.add_argument(
+        "--aime-prompt-len",
+        type=int,
+        default=None,
+        help="The prompt length of the model for the AIME dataset. Requests longer than the prompt length will be dropped.",
     )
     args = parser.parse_args()
     run_benchmark(args)

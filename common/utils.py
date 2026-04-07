@@ -97,8 +97,8 @@ def resolve_vllm_log_paths(
             "rank_logs": rank_candidates,
         }
     else:
-        prefill_server_candidates = [f"vllm_{gpu_upper}_prefill_main_server.log"]
-        decode_server_candidates  = [f"vllm_{gpu_upper}_decode_main_server.log"]
+        prefill_server_candidates = [f"vllm_{gpu_upper}_main_prefill_server.log"]
+        decode_server_candidates  = [f"vllm_{gpu_upper}_main_decode_server.log"]
         prefill_rank_patterns = [ f"vllm_{gpu.lower()}_prefill_rank_dp_*_tp_*.txt" ]
         decode_rank_patterns  = [ f"vllm_{gpu.lower()}_decode_rank_dp_*_tp_*.txt" ]
         prefill_rank_candidates = []

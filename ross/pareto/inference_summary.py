@@ -8,39 +8,69 @@ from common.config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
-SummaryColumns = [
-    "model", "isl", "osl", "batch_size", "request_rate", "duration", "timing_phases", "prefill_phases", "decode_phases",
-    "dp", "pp", "tp",
-    "prefill_dp", "prefill_pp", "prefill_tp",
-    "decode_dp", "decode_pp", "decode_tp",
-    "mem_fraction_static", "chunked_prefill_size",
+# ---------------------------------------------------------------------------
+# Column groups (building blocks)
+# ---------------------------------------------------------------------------
+
+# Identity / workload
+ID_COLUMNS = ["model", "isl", "osl", "batch_size", "request_rate"]
+
+# Parallelism
+PARALLEL_COLUMNS_COLOCATE = ["dp", "pp", "tp"]
+PARALLEL_COLUMNS_DISAGG   = ["prefill_dp", "prefill_pp", "prefill_tp",
+                              "decode_dp",  "decode_pp",  "decode_tp"]
+
+# Scheduler knobs (per backend)
+SCHEDULER_COLUMNS_SGL  = ["mem_fraction_static", "chunked_prefill_size"]
+SCHEDULER_COLUMNS_VLLM = ["gpu_memory_utilization", "max_num_batched_tokens"]
+
+# Performance metrics
+PERF_COLUMNS = [
+    "duration",
     "tokens/s", "tokens/s/gpu", "tokens/s/user", "throughput",
-    "mean_ttft_ms", "median_ttft_ms", "std_ttft_ms", "p99_ttft_ms", 
-    "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms", 
-    "mean_itl_ms", "median_itl_ms", "std_itl_ms", "p99_itl_ms",
-    "mean_e2e_latency_ms", "median_e2e_latency_ms", "std_e2e_latency_ms", "p99_e2e_latency_ms", 
+    "mean_ttft_ms",       "median_ttft_ms",       "std_ttft_ms",       "p99_ttft_ms",
+    "mean_tpot_ms",       "median_tpot_ms",       "std_tpot_ms",       "p99_tpot_ms",
+    "mean_itl_ms",        "median_itl_ms",         "std_itl_ms",        "p99_itl_ms",
+    "mean_e2e_latency_ms","median_e2e_latency_ms", "std_e2e_latency_ms","p99_e2e_latency_ms",
 ]
 
-DisaggPrintedColumns = [
-    "model", "isl", "osl", "batch_size", "request_rate",
-    "prefill_dp", "prefill_pp", "prefill_tp",
-    "decode_dp", "decode_pp", "decode_tp",
-    "mem_fraction_static", "chunked_prefill_size",
-    "tokens/s", "tokens/s/gpu", "tokens/s/user",
-    "mean_ttft_ms", "median_ttft_ms", "std_ttft_ms", "p99_ttft_ms", 
-    "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms", 
-    "mean_e2e_latency_ms", "median_e2e_latency_ms", "std_e2e_latency_ms", "p99_e2e_latency_ms", 
+# Internal phase breakdown (stored in DataFrame but not printed)
+PHASE_COLUMNS = ["timing_phases", "prefill_phases", "decode_phases"]
+
+# ---------------------------------------------------------------------------
+# Composed column lists
+# ---------------------------------------------------------------------------
+
+# Full simulator output (used to construct result DataFrames)
+SummaryColumns = (
+    ID_COLUMNS
+    + PARALLEL_COLUMNS_COLOCATE
+    + PARALLEL_COLUMNS_DISAGG
+    + SCHEDULER_COLUMNS_SGL
+    + PHASE_COLUMNS
+    + PERF_COLUMNS
+)
+
+# Human-readable print views
+ColocatePrintedColumns = ID_COLUMNS + PARALLEL_COLUMNS_COLOCATE + SCHEDULER_COLUMNS_SGL + PERF_COLUMNS
+DisaggPrintedColumns   = ID_COLUMNS + PARALLEL_COLUMNS_DISAGG   + SCHEDULER_COLUMNS_SGL + PERF_COLUMNS
+
+# ---------------------------------------------------------------------------
+# ross_predict.py record columns
+# ---------------------------------------------------------------------------
+
+RECORD_ID_COLS_COMMON = ["Platform", "model", "parallel", "iosl", "rate"]
+
+RECORD_COMPARISON_COLS = [
+    "pe", "pe_mean_ttft", "pe_mean_tpot", "pe_mean_itl", "pe_mean_throughput",
+    "ross_duration",      "framework_duration",
+    "ross_mean_ttft",     "framework_mean_ttft",
+    "ross_mean_tpot",     "framework_mean_tpot",
+    "ross_mean_itl",      "framework_mean_itl",
+    "ross_mean_throughput","framework_mean_throughput",
 ]
 
-ColocatePrintedColumns = [
-    "model", "isl", "osl", "batch_size", "request_rate",
-    "dp", "pp", "tp",
-    "mem_fraction_static", "chunked_prefill_size",
-    "tokens/s", "tokens/s/gpu", "tokens/s/user",
-    "mean_ttft_ms", "median_ttft_ms", "std_ttft_ms", "p99_ttft_ms", 
-    "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms", 
-    "mean_e2e_latency_ms", "median_e2e_latency_ms", "std_e2e_latency_ms", "p99_e2e_latency_ms", 
-]
+RECORD_NO_COMPARISON_COLS = ["duration", "mean_ttft_ms", "mean_tpot_ms", "mean_itl_ms", "throughput"]
 
 MOE_MODELS = ["deepseek", "qwen3-235b-a22b", "qwen3-30b-a3b", "mistral"]
 

@@ -26,22 +26,24 @@ repopath, reponame, etcpath = resolve_repo(sys.argv[0])
 import util
 ###############################################################################
 
+DEFAULT_MODELING_DIR = str(Path(repopath) / "modeling")
+
 avail_backends   = ["vllm", "sglang", "tensorrt"]
 avail_mode       = ["online", "offline"]
-avail_dataset    = ["random", "sharegpt", "bigcodebench", "humanevalplus", "repoqa"]
+avail_dataset    = ["sharegpt", "repoqa", "aime"]
 DEFAULT_MODE     = "online"
 DEFAULT_GPU      = "H200"
 DEFAULT_MODELS   = "Qwen2.5-72B-Instruct"
 DEFAULT_PARALLEL = "1:1:8"
-DEFAULT_BATCH    = "32" # per GPU
+DEFAULT_BATCH    = "64" # per GPU
 DEFAULT_RATE     = "inf"
-DEFAULT_INPUT    = "sharegpt@500_100"
+DEFAULT_INPUT    = "sharegpt@0_0"
 DEFAULT_RESERVE  = 0.9
 DEFAULT_CHUNK_PREFILL_SIZE = 8192
 
 def show_help():
     help_text = f"""
-usage: bench.py [options]
+usage: ross_predict.py [options]
 
 optional arguments:
   --backend BACKENDS       Comma-separated list of backends ({"/".join(avail_backends)}) to benchmark.
@@ -99,7 +101,7 @@ optional arguments:
                            *** Priority: default value < config file < command line args. ***
                            For repeated or large-scale test runs, it is recommended to put frequently used arguments 
                            into the config file instead of typing long command lines every time. This allows running:
-                               python bench.py --config FILE
+                               python ross_predict.py --config FILE
                            to reproduce or simplify benchmark executions.
   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
   
@@ -161,27 +163,18 @@ class BenchmarkConfig:
         self.port_ray     = 55556
 
         self.args = {b: [] for b in avail_backends}
-        self.all_workers  = []
         import torch
         num_gpu = torch.cuda.device_count()
         self.num_gpu      = num_gpu
-        with open(etcpath + "/cluster_info", "r") as f:
-            for line in f.readlines():
-                items = line.strip().split()
-                if items[3] == self.gpuname:
-                    self.all_workers.append((items[1], items[2], num_gpu, items[3]))
-                    if items[1] == self.hostname:
-                        self.all_workers[0], self.all_workers[-1] = self.all_workers[-1], self.all_workers[0]
 
         self.raw          = args
         self.backends     = self._split(args.backend)
-        self.backend_opts = None
+        self.platforms    = None
         self.models       = [util.get_model(m) for m in self._split(args.model)]
         self.mode         = args.mode
 
         self.disaggregation_mode = "colocation"
 
-        self.workers      = self._split(args.worker)
         self.parallel     = args.parallel
         self.batches      = self._split_int(args.batch)
         self.rates        = self._split(args.rate)
@@ -195,6 +188,7 @@ class BenchmarkConfig:
         self.quiet        = args.quiet
         self.validation   = args.validation
         self.config       = str(Path(args.config).expanduser().resolve()) if args.config else None
+        self.modeling_dir = args.modeling_dir if hasattr(args, "modeling_dir") else None
         self.envs.update(self._split_dict(args.env))
         self._parse_args(args.args)
 
@@ -218,10 +212,10 @@ class BenchmarkConfig:
             if Path(venv).is_dir():
                 version = util.echo_back(f"bash -l -c 'source {venv}/bin/activate && pip show {framework.lower()} | grep \"^Version:\" | cut -d\" \" -f2'", capture=True)
             else:
-                if not self.backend_opts:
+                if not self.platforms:
                     raise RuntimeError(f"{venv} does not exist!")
 
-                version = self.backend_opts[0][1]
+                version = self.platforms[0]["version"]
             self.backend_info[framework] = {
                 "version": version if version is not None and version != "" else "nover",
                 "venv": venv
@@ -242,27 +236,16 @@ class BenchmarkConfig:
                     if "chunked_prefill_size" not in param_dict.keys():
                         param_dict["chunked_prefill_size"] = [DEFAULT_CHUNK_PREFILL_SIZE]
 
-        if len(self.workers) == 0:
-            self.workers = [workers for workers in self.all_workers if workers[0] == self.hostname]
-        else:
-            s1 = set(self.workers)
-            s2 = set([item[0] for item in self.all_workers])
-            assert s1.issubset(s2), f"Available workers: {s2}, but got: {s1}"
-            worker_dict = {item[0]: item for item in self.all_workers}
-            self.workers = [worker_dict[host] for host in self.workers]
-
         # self.parallel = self._parse_parallel(self.parallel)
         self.parallel = self._split(self.parallel)
         for input in ([self.input] + self.inputs):
             location = ""
             if input["dataset"] == "sharegpt":
                 location = f"{self.datapath}/ShareGPT_V3_unfiltered_cleaned_split.json"
-            elif input["dataset"] == "bigcodebench":
-                location = f"{self.datapath}/bigcodebench_complete.jsonl"
-            elif input["dataset"] == "humanevalplus":
-                location = f"{self.datapath}/humanevalplus.jsonl"
             elif input["dataset"] == "repoqa":
                 location = f"{self.datapath}/repoqa.jsonl"
+            elif input["dataset"] == "aime":
+                location = ""  # loaded from HuggingFace, no local file needed
             input["path"] = location
 
         if location != "":
@@ -292,6 +275,8 @@ class BenchmarkConfig:
             self.output = str(Path(etcpath).expanduser().resolve())
         if not self.datapath:
             self.datapath =  str(Path(etcpath).expanduser().resolve())
+        if not self.modeling_dir:
+            self.modeling_dir = DEFAULT_MODELING_DIR
         for key in self.args.keys():
             if len(self.args[key]) == 0:
                 self.args[key].append({})
@@ -308,8 +293,11 @@ class BenchmarkConfig:
 
             if len(self.backends) == 0 and "backend" in conf.keys():
                 self.backends = self._as_list(conf["backend"])
-            if "backend_opts" in conf.keys():
-                self.backend_opts = conf["backend_opts"]
+            if "platforms" in conf.keys():
+                self.platforms = [{"gpu": p["gpu"], "version": p["version"]} for p in conf["platforms"]]
+            elif "backend_opts" in conf.keys():
+                # backward-compat: old list-of-arrays format [["H200", "0.5.6"]]
+                self.platforms = [{"gpu": p[0], "version": p[1]} for p in conf["backend_opts"]]
             if len(self.models) == 0 and "model" in conf.keys():
                 models = self._as_list(conf["model"])
                 self.models = [util.get_model(m) for m in models]
@@ -337,8 +325,8 @@ class BenchmarkConfig:
                 self.output = str(Path(conf["output"]).expanduser().resolve())
             if not self.datapath and "datapath" in conf.keys():
                 self.datapath = str(Path(conf["datapath"]).expanduser().resolve())
-            if len(self.workers) == 0 and "worker" in conf.keys():
-                self.workers = self._as_list(conf["worker"])
+            if not self.modeling_dir and "modeling_dir" in conf.keys():
+                self.modeling_dir = str(Path(conf["modeling_dir"]).expanduser().resolve())
 
             if "env" in conf.keys():
                 self.envs.update(conf["env"])
@@ -364,24 +352,6 @@ class BenchmarkConfig:
             util.erro(f"{self.output} does not exist!")
         if not Path(self.datapath).is_dir():
             util.erro(f"{self.datapath} does not exist!")
-
-    def kill_procs(self, backend="sglang", venv=None):
-        print()
-        if backend == "sglang":
-            util.echo_back(f"pkill -f sglang_router.launch_router")
-            util.echo_back(f"pkill -9 -f 'sglang::'") # ::router
-            
-            venv = self.backend_info[backend]["venv"]
-            for worker in self.workers:
-                host_name, _, _, _ = worker
-                util.echo_back(f"ssh -p {self.port_ssh} root@{host_name} 'pkill -f sglang.launch_server'")
-                util.echo_back(f"ssh -p {self.port_ssh} root@{host_name} 'pkill -9 -f \"{venv}/bin/python3\"'")
-        elif backend == "vllm":
-            util.echo_back(f"pkill -9 -f 'vllm serve'")
-            for worker in self.workers:
-                host_name, _, _, _ = worker
-                util.echo_back(f"ssh -p {self.port_ssh} root@{host_name} 'pkill -9 -f \"{venv}/bin/python3\"'")
-                util.echo_back(f"ssh -p {self.port_ssh} root@{host_name} 'pkill -9 -f \"VLLM::\"'")
 
     def parse_parallel(self, s, remove_p=None, remove_d=None, sep=False):
         iter_host, iter_gpu = 0, 0
@@ -605,31 +575,33 @@ class BenchmarkConfig:
     def summary(self):
         """Printable config summary."""
         s = []
-        s.append(f"Backends     : {self.backends[0]:8}  version={self.backend_info[self.backends[0]]['version']:15} venv={self.backend_info[self.backends[0]]['venv']}")
+        # Backend + version
+        s.append(f"Backend      : {self.backends[0]:8}  version={self.backend_info[self.backends[0]]['version']}")
         for i in range(1, len(self.backends)):
-            s.append(f"                      {self.backends[i]:8}  version={self.backend_info[self.backends[i]]['version']:15} venv={self.backend_info[self.backends[i]]['venv']}")
-        s.append(f"       Models       : {self.models}")
+            s.append(f"               {self.backends[i]:8}  version={self.backend_info[self.backends[i]]['version']}")
+        # Platforms (GPU targets, predict-mode only)
+        if self.platforms:
+            gpus = ", ".join(f"{p['gpu']} ({p['version']})" for p in self.platforms)
+            s.append(f"       Platforms    : {gpus}")
+        s.append(f"       Models       : {[Path(m).name for m in self.models]}")
         s.append(f"       Mode         : {self.mode}")
         s.append(f"       Parallel     : {self.parallel}")
         s.append(f"       Batches      : {self.batches}")
-        s.append(f"       Inputs       : {self.inputs}")
+        s.append(f"       Rates        : {self.rates}")
+        s.append(f"       Inputs       : {[inp.get('dataset','?') + '@' + str(inp.get('isl',('?','?'))[0]) + '_' + str(inp.get('osl',('?','?'))[0]) for inp in self.inputs]}")
         s.append(f"       Output       : {self.output}")
-        s.append(f"       Worker       : {self.workers}")
-        s.append(f"       All Workers  : {self.all_workers}")
-        s.append(f"       Env Vars     : {self.envs}")
+        s.append(f"       Modeling dir : {self.modeling_dir}")
+        s.append(f"       Config       : {self.config}")
+        # Scheduler args (only the current backend's params)
         for i, key in enumerate(self.args.keys()):
-            if i == 0:
-                s.append(f"       Extra Args   : {key:8} = {self.args[key]}")
-            else:
-                s.append(f"                      {key:8} = {self.args[key]}")
-        s.append(f"       Config path  : {self.config}")
+            label = "Scheduler args" if i == 0 else "              "
+            s.append(f"       {label} : {key} = {self.args[key]}")
         s.append(f"       Override     : {self.override}")
         s.append(f"       Validation   : {self.validation}")
-        s.append(f"       Verbose      : {not self.quiet}")
-
         return "\n".join(s)
 
 def build_parser():
+    """Build the base argument parser shared by bench.py and predict scripts."""
     parser = argparse.ArgumentParser(add_help=False)
 
     parser.add_argument("--backend",    type=str,   help="Comma-separated backend list")
@@ -640,19 +612,147 @@ def build_parser():
     parser.add_argument("--rate",       type=str,   help="Request rates, comma-separated")
     parser.add_argument("--input",      type=str,   help="Dataset input spec")
     parser.add_argument("--output",     type=str,   help="Output directory")
-    parser.add_argument("--worker",     type=str,   help="")
-    parser.add_argument("--datapath",   type=str,   help="")
-    parser.add_argument("--config",     type=str,   help="")
-    parser.add_argument("--env",        type=str,   help="Environment variables KEY=VALUE (repeatable)")
+    parser.add_argument("--datapath",   type=str,   help="Absolute path to dataset directory")
+    parser.add_argument("--config",       type=str,   help="Path to JSON config file")
+    parser.add_argument("--modeling-dir", type=str,   dest="modeling_dir", help=f"Path to modeling directory containing xgboost models (default: {DEFAULT_MODELING_DIR})")
+    parser.add_argument("--env",          type=str,   help="Environment variables KEY=VALUE (repeatable)")
     parser.add_argument("--args",       type=str,   help="Extra args for engine")
     parser.add_argument("--validation", action="store_true")
     parser.add_argument("--override",   action="store_true")
     parser.add_argument("--quiet",      action="store_true")
-    parser.add_argument("--verbose",    action="store_true")
-    parser.add_argument("--kill",       action="store_true")
     parser.add_argument("-h", "--help", action="store_true")
 
     return parser
+
+
+def show_predict_help():
+    """Print help text for ross_predict.py."""
+    help_text = f"""
+usage: ross_predict.py [options]
+
+ROSS Simulator — offline prediction script.
+Runs the ROSS simulator over a sweep of configurations and optionally
+compares results against real execution traces.
+
+Select a backend with --backend (sglang or vllm).
+
+────────────────────────────────────────────────────────────────────────────
+SHARED OPTIONS  (identical to bench.py — see docs/bench_config.md)
+────────────────────────────────────────────────────────────────────────────
+
+  --config FILE            Path to JSON configuration file.
+                           Priority: default < config file < command-line args.
+                           Recommended for large sweeps; keeps command lines short.
+
+  --backend BACKEND        Backend to simulate: sglang | vllm  (REQUIRED)
+
+  --model MODELS           Comma-separated model names or full paths.
+                           Default: {DEFAULT_MODELS}
+
+  --parallel PARALLEL      Comma-separated parallelism specs.
+                           Colocate  : dp:pp:tp           (e.g. 1:1:8)
+                           Disaggreg.: dp:pp:tp@dp:pp:tp  (e.g. 1:1:4@1:1:4)
+                           Default: {DEFAULT_PARALLEL}
+
+  --batch BATCH_SIZES      Comma-separated max-batch-size values (per GPU).
+                           Default: {DEFAULT_BATCH}
+
+  --rate RATES             Comma-separated request rates (req/s).
+                           Use "inf" for offline / max-throughput mode.
+                           Default: {DEFAULT_RATE}
+
+  --input INPUT_SPEC       Dataset and sequence-length spec.
+                           Format: dataset[@isl_osl]
+                             dataset  ∈ {{{", ".join(avail_dataset)}}}
+                             isl/osl  : integer (e.g. 128) or range X:Y (e.g. 64:256)
+                           Examples:
+                             sharegpt               (use built-in ISL/OSL defaults)
+                             repoqa@4096_1024
+                             aime@512_8192
+                             sharegpt@64:256_100
+                           Default: {DEFAULT_INPUT}
+
+  --output OUTPUT_PATH     Directory for benchmark logs and results.
+  --datapath PATH          Absolute path to dataset directory.
+  --modeling-dir PATH      Path to xgboost model directory.
+                           Default: <repo_root>/modeling
+
+  --mode MODE              online | offline  (default: {DEFAULT_MODE})
+  --worker HOSTNAMES       Comma-separated worker hostnames.
+  --env KEY=VALUE          Extra environment variables.
+  --args STRING            Backend scheduler arguments.
+                           SGLang: --args "sglang@mem_fraction_static=0.9,chunked_prefill_size=8192"
+                           vLLM:   --args "vllm@gpu_memory_utilization=0.9,max_num_batched_tokens=8192"
+
+────────────────────────────────────────────────────────────────────────────
+PREDICT-ONLY OPTIONS
+────────────────────────────────────────────────────────────────────────────
+
+  --debug                  Enable verbose/DEBUG-level logging.
+  --record-path FILE       Write per-configuration PE metrics to a CSV file.
+  --eval                   Load real trace logs and compare against simulator results.
+
+  --max-workers INT        Number of parallel worker processes. 0 = auto (default: 0)
+  --threads-per-worker INT CPU threads per worker. 0 = auto (default: 0)
+
+  --get-pareto-front       Enumerate parallel configs and compute Pareto front
+                           (tokens/s/user vs tokens/s/gpu). Incompatible with --eval.
+
+────────────────────────────────────────────────────────────────────────────
+CONFIG FILE EXAMPLE
+────────────────────────────────────────────────────────────────────────────
+
+  {{
+      "backend": "sglang",
+      "model":   "Qwen2.5-72B-Instruct",
+      "parallel": "1:1:8",
+      "batch":   "32",
+      "rate":    ["1", "2", "4", "inf"],
+      "input":   "sharegpt@0_0",
+      "platforms": [{{"gpu": "H200", "version": "0.6.6.post1"}}],
+      "ross_extra": [{{"backend": "sglang", "mem_fraction_static": [0.9], "chunked_prefill_size": [8192]}}]
+  }}
+
+  python ross_predict.py --config config.json --record-path out.csv
+
+  -h, --help               Show this help message and exit.
+"""
+    print(help_text)
+
+
+def build_predict_parser():
+    """Build the argument parser for ross_predict.py."""
+    parser = build_parser()
+
+    # ── predict-specific arguments ──────────────────────────────────────────
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Enable verbose/DEBUG-level logging.")
+    parser.add_argument("--record-path", type=str, default="", metavar="FILE",
+                        help="Write per-configuration PE metrics to a CSV file.")
+    parser.add_argument("--eval", action="store_true", default=False,
+                        help="Load real trace logs and compare against simulator results.")
+    parser.add_argument("--max-workers", type=int, default=0,
+                        help="Number of parallel worker processes. 0=auto.")
+    parser.add_argument("--threads-per-worker", type=int, default=0,
+                        help="CPU threads per worker process. 0=auto.")
+    parser.add_argument("--get-pareto-front", action="store_true",
+                        help="Enumerate parallel configs and compute Pareto front.")
+    parser.add_argument("--cache-worker-config", action="store_true",
+                        help="Cache heavy simulator objects within each worker (SGL only).")
+
+    return parser
+
+
+def parse_predict_args():
+    """Parse sys.argv for ross_predict.py, printing help and exiting if needed."""
+    parser = build_predict_parser()
+    args = parser.parse_args()
+
+    if args.help or len(sys.argv) <= 1:
+        show_predict_help()
+        sys.exit(0)
+
+    return args
 
 def main():
     global repopath, reponame, etcpath

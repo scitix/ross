@@ -63,10 +63,15 @@ class VirtualClientStore(RequestStore):
         self.num_prompts = len(self.requests)
 
         if request_rate == "inf":
-            intervals = np.random.exponential(0, size=self.num_prompts)
+            self.arrival_times = np.zeros(self.num_prompts, dtype=float)
         else:
-            intervals = np.random.exponential(1.0 / float(request_rate), size=self.num_prompts)
-        self.ideal_arrivals = np.cumsum(intervals)
+            # Frontend logs already encode the global arrival pattern before
+            # client-side concurrency throttling. Preserve these absolute
+            # arrivals; available slots only delay request readiness/admission.
+            self.arrival_times = np.array(
+                [max(0.0, float(req.arrive_time)) for req in self.requests],
+                dtype=float,
+            )
 
         self.dp_size = dp_size
         self.next_to_admit_idx = 0
@@ -84,8 +89,7 @@ class VirtualClientStore(RequestStore):
         heapq.heappush(self.available_slots, (finish_time, slot_id))
         if self.inflight > 0:
             self.inflight -= 1
-            # if len(list(self.finish_times.values())) % 100 == 0:
-            #     print(f"New Finish: rid = {rid}, finish_time = {finish_time}")
+            # print(f"New Finish: rid = {rid}, finish_time = {finish_time}")
         else:
             raise RuntimeError(f"record_finish called when inflight=0 (rid={rid})")
 
@@ -99,8 +103,7 @@ class VirtualClientStore(RequestStore):
         effective_wall_time = current_wall_time
         if self.inflight == 0 and self.next_to_admit_idx < self.num_prompts and self.available_slots:
             next_req = self.requests[self.next_to_admit_idx]
-            slot_base_t, _ = self.available_slots[0]
-            next_ingress_t = slot_base_t + float(self.ideal_arrivals[self.next_to_admit_idx])
+            next_ingress_t = float(self.arrival_times[self.next_to_admit_idx])
             next_ready_t = next_ingress_t + next_req.tokenize_time
             effective_wall_time = max(effective_wall_time, next_ready_t)
 
@@ -114,10 +117,10 @@ class VirtualClientStore(RequestStore):
         while self.next_to_admit_idx < self.num_prompts and self.available_slots:
             idx = self.next_to_admit_idx
             new_req = self.requests[idx]
-            slot_base_t, slot_id = self.available_slots[0]
-            ingress_t = slot_base_t + float(self.ideal_arrivals[idx])
+            slot_ready_t, slot_id = self.available_slots[0]
+            ingress_t = float(self.arrival_times[idx])
             ready_t = ingress_t + new_req.tokenize_time
-            admit_t = max(ready_t, effective_wall_time)
+            admit_t = max(ready_t, slot_ready_t)
 
             if admit_t <= effective_wall_time:
                 heapq.heappop(self.available_slots)
@@ -126,7 +129,11 @@ class VirtualClientStore(RequestStore):
                     new_req.decode_dp_rank = new_req.prefill_dp_rank
                 else:
                     new_req.dp_rank = idx % self.dp_size
-                new_req.arrive_time = ingress_t
+                # Preserve the frontend-observed arrival separately. Engine-side
+                # latency metrics should start once the request has both finished
+                # client-side prep and acquired a concurrency slot.
+                new_req.client_arrive_time = ingress_t
+                new_req.arrive_time = admit_t
                 new_req.ready_time = admit_t
                 self.request_slots[new_req.request_id] = slot_id
 

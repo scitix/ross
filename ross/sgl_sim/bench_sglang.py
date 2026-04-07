@@ -1,6 +1,5 @@
 import argparse
 import pandas as pd
-import json
 import sys
 import time
 from typing import List, Dict, Any, Tuple, Optional
@@ -14,11 +13,25 @@ from common.models import BaseModel
 import logging
 logger = logging.getLogger(__name__)
 
+
+def _resolve_sgl_model_paths(modeling_dir: str, moe: bool) -> dict:
+    """Build xgboost model path dict from a single modeling_dir root."""
+    tag     = "moe" if moe else "dense"
+    fwd_dir = "moe_foward" if moe else "dense_forward"   # preserve upstream typo
+    base    = Path(modeling_dir) / "sgl"
+    return {
+        "prefill_pre_forward_path":  str(base / f"{tag}_pre/prefill/pre_forward_trained_models/xgboost_model"),
+        "decode_pre_forward_path":   str(base / f"{tag}_pre/decode/pre_forward_trained_models/xgboost_model"),
+        "prefill_forward_path":      str(base / f"{fwd_dir}/prefill/forward_trained_models/xgboost_model"),
+        "decode_forward_path":       str(base / f"{fwd_dir}/decode/forward_trained_models/xgboost_model"),
+        "prefill_post_forward_path": str(base / "dense_post/post_forward_trained_models/xgboost_model"),
+        "decode_post_forward_path":  str(base / "dense_post/post_forward_trained_models/xgboost_model"),
+    }
+
 def bench_online(
     model_uri: str,
     runtime_config: RuntimeConfig,
     config_dict: Dict[str, Any],
-    trace_configs: Dict[str, Any] | None = None
 ):
     SIM_ROOT = str(Path(__file__).resolve().parent)
     for path in (SIM_ROOT,):
@@ -32,7 +45,7 @@ def bench_online(
         
     args = argparse.Namespace(**config_dict)
     # print(args)
-    result_dict = run_sim(args, trace_configs)
+    result_dict = run_sim(args)
 
     result_dict.update({
         "model": model_uri,
@@ -52,18 +65,14 @@ def find_best_colocate_result_under_constraints(
         model_uri: str,
         inference_config: InferenceConfig,
         runtime_config: RuntimeConfig,
+        modeling_dir: str,
         platform_perf_yaml: str | None = None,
         top_k: int = 1,
-        trace_configs: Dict[str, Any] | None = None
+        cache_worker_config: bool = False,
 ) -> InferenceSummary:
     results_df = pd.DataFrame(columns=SummaryColumns)
 
-    with open("./ross_config.json", "r", encoding="utf-8") as f:
-        ross_config = json.load(f)
-        if is_moe(model_uri):
-            config_dict = ross_config["sglang"]["moe"]
-        else:
-            config_dict = ross_config["sglang"]["dense"]
+    config_dict = _resolve_sgl_model_paths(modeling_dir, is_moe(model_uri))
 
     if platform_perf_yaml is not None:
         config_dict["platform_perf"] = platform_perf_yaml
@@ -86,10 +95,11 @@ def find_best_colocate_result_under_constraints(
         "reserved_decode_tokens": 512,
 
         "disaggregation": False,
+        "cache_worker_config": cache_worker_config,
     })
 
     try:
-        summary = bench_online(model_uri, runtime_config, config_dict, trace_configs)
+        summary = bench_online(model_uri, runtime_config, config_dict)
     except MemoryError as e:
         summary = InferenceSummary(runtime_config=runtime_config)
         summary.set_oom(True)
@@ -108,20 +118,16 @@ def find_best_disagg_result_under_constraints(
         prefill_inference_config: InferenceConfig,
         decode_inference_config: InferenceConfig,
         runtime_config: RuntimeConfig,
+        modeling_dir: str,
         gpu: str = '',
         platform_perf_yaml: str | None = None,
         top_k: int = 1,
-        trace_configs: Dict[str, Any] | None = None
+        cache_worker_config: bool = False,
 ) -> InferenceSummary:
     results_df = pd.DataFrame(columns=SummaryColumns)
     results_dict_list = []
 
-    with open("./ross_config.json", "r", encoding="utf-8") as f:
-        ross_config = json.load(f)
-        if is_moe(model_uri):
-            config_dict = ross_config["sglang"]["moe"]
-        else:
-            config_dict = ross_config["sglang"]["dense"]
+    config_dict = _resolve_sgl_model_paths(modeling_dir, is_moe(model_uri))
 
     if platform_perf_yaml is not None:
         config_dict["platform_perf"] = platform_perf_yaml
@@ -149,10 +155,11 @@ def find_best_disagg_result_under_constraints(
 
         "disaggregation": True,
         "tokenize_url": "http://127.0.0.1:8001/tokenize",
+        "cache_worker_config": cache_worker_config,
     })
     
     try:
-        summary = bench_online(model_uri, runtime_config, config_dict, trace_configs)
+        summary = bench_online(model_uri, runtime_config, config_dict)
     except MemoryError as e:
         summary = InferenceSummary(runtime_config=runtime_config)
         summary.set_oom(True)

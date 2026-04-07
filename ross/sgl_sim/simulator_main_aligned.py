@@ -9,19 +9,26 @@ from queue import PriorityQueue
 from collections import deque
 from typing import List, Tuple, Dict, Any
 
-TEST_ROOT = Path(__file__).resolve().parents[1]
+TEST_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TEST_ROOT))
 
 from common.features import PlatformPerf
 from common.models import get_model, BaseModel
 from common.config import InferenceConfig
 from common.kvpool import SGLKVCachePool
-from common.sim_transport import VirtualClientStore
+from common.sim_http_perf import VirtualClientStore
 
 from scheduler.request import Request
 from scheduler.scheduler import Scheduler, Batch
 
-from simulator_main import get_ross_models, update_metrics, calulcate_benchmark_results, check_sched_idle
+from simulator_main import (
+    get_ross_models,
+    get_cached_platform_perf,
+    get_cached_worker_config,
+    update_metrics,
+    calulcate_benchmark_results,
+    check_sched_idle,
+)
 
 import logging
 logger = logging.getLogger(__name__)
@@ -59,6 +66,7 @@ def parse_args():
     ap.add_argument("--dataset-path", type=str, required=True)
     ap.add_argument("--frontend-path", type=str, required=True)
     ap.add_argument("--request-rate", type=str, required=True)
+    ap.add_argument("--post-decode-overhead-ms", type=float, default=0.0)
     # ap.add_argument('--scheduler_config', type=str, help='Path to the Scheduler YAML configuration file.')
 
     ap.add_argument('--platform-perf', type=str, required=True, help='Path to the Platform Performance file.')
@@ -69,6 +77,7 @@ def parse_args():
     ap.add_argument('--decode_pre_forward_path', type=str, required=True, help='Path to the Saved PRE-FORWARD Model file.')
     ap.add_argument('--decode_forward_path', type=str, required=True, help='Path to the Saved [Decode] FORWARD Model file.')
     ap.add_argument('--decode_post_forward_path', type=str, required=True, help='Path to the Saved [Decode] POST-FORWARD Model file.')
+    ap.add_argument('--cache-worker-config', action='store_true', default=False, help='Cache heavy simulator objects within each worker process.')
 
     return ap.parse_args()
 
@@ -141,7 +150,6 @@ class PrefillWorker(BaseWorker):
             pp=pp,
             **scheduler_kwargs)
         self.pending_reqs = deque(request_list)
-        self.prealloc_queue = []
         self.timing_phases = { "pre_forward": 0, "forward": 0, "post_forward": 0 }
 
     def add_requests(self, new_reqs: List[Request]):
@@ -150,49 +158,39 @@ class PrefillWorker(BaseWorker):
         self.pending_reqs.extend(new_reqs)
         self.complete = False
 
-    def fetch_new_request(self):
-        while self.pending_reqs and self.pending_reqs[0].arrive_time <= self.wall_time:
-            self.prealloc_queue.append(self.pending_reqs.popleft())
-                
-        # If idle, jump to the next queued request arrival for this worker.
-        if check_sched_idle(self.scheduler, self.batch_pipeline, self.step, self.pp) and not self.prealloc_queue:
-            if self.pending_reqs:
-                req_next = self.pending_reqs.popleft()
-                self.wall_time = max(self.wall_time, req_next.arrive_time)
-                self.prealloc_queue.append(req_next)
-                logger.debug(
-                    f"[PrefillFetch] worker={self.dp_rank} jump_to_arrival={self.wall_time:.5f}, "
-                    f"pending={len(self.pending_reqs)}, prealloc={len(self.prealloc_queue)}"
-                )
-            else:
-                self.complete = True
-    
-    def process_prealloc_queue(self, decode_workers: List["DecodeWorker"]):
-        remain = []
-        admitted = 0
-        for req in self.prealloc_queue:
+    def fetch_new_request(self, decode_workers):
+        retry_time = None
+        retained_reqs = deque()
+        while self.pending_reqs:
+            req = self.pending_reqs.popleft()
+            if req.ready_time > self.wall_time:
+                retained_reqs.append(req)
+                continue
             decode_worker = decode_workers[req.decode_dp_rank]
             if decode_worker.reserve_prefill_kv(req):
                 self.scheduler.waiting_queue.append(req)
-                admitted += 1
-            else:
-                remain.append(req)
-        self.prealloc_queue = remain
-        if admitted or remain:
-            logger.debug(
-                f"[PrefillPrealloc] worker={self.dp_rank}, admitted={admitted}, blocked={len(remain)}, "
-                f"waiting={len(self.scheduler.waiting_queue)}, pending={len(self.pending_reqs)}"
-            )
-        if self.prealloc_queue:
-            self.complete = False
-        return
+                continue
+            retained_reqs.append(req)
+            worker_retry_time = decode_worker.wall_time
+            if worker_retry_time <= self.wall_time:
+                worker_retry_time = self.wall_time + 1e-9
+            retry_time = worker_retry_time if retry_time is None else min(retry_time, worker_retry_time)
+        self.pending_reqs = retained_reqs
 
-    def is_blocked_on_decode(self) -> bool:
-        return (
-            bool(self.prealloc_queue)
-            and len(self.scheduler.waiting_queue) == 0
-            and self.scheduler.running_batch.is_empty()
-        )
+        # If idle, jump to the next queued request arrival or decode reservation retry.
+        if check_sched_idle(self.scheduler, self.batch_pipeline, self.step, self.pp):
+            next_ready_time = self.pending_reqs[0].ready_time if self.pending_reqs else None
+            if next_ready_time is not None and next_ready_time <= self.wall_time:
+                next_ready_time = self.wall_time + 1e-9
+            candidates = [t for t in (next_ready_time, retry_time) if t is not None]
+            if candidates:
+                self.wall_time = max(self.wall_time, min(candidates))
+                logger.debug(
+                    f"[PrefillFetch] worker={self.dp_rank} jump_to_ready={self.wall_time:.5f}, "
+                    f"pending={len(self.pending_reqs)}, waiting={len(self.scheduler.waiting_queue)}"
+                )
+            else:
+                self.complete = True
 
     def forward(self, ross_models):
         self.step += 1
@@ -343,7 +341,11 @@ class DecodeWorker(BaseWorker):
                 self.wall_time += _time_step / 1000
                 logger.debug(f"    mode=decode, stage={name}, time spent: {_time_step:.2f} ms")
         else:
-            if self.scheduler.running_batch.is_empty() and (not self.complete_events) and len(self.scheduler.waiting_queue) == 0:
+            if (
+                self.scheduler.running_batch.is_empty()
+                and (not self.complete_events)
+                and len(self.scheduler.waiting_queue) == 0
+            ):
                 self.complete = True
                 return None
             if self.scheduler.running_batch.is_empty() and self.complete_events:
@@ -356,12 +358,12 @@ class DecodeWorker(BaseWorker):
                         raise MemoryError(f"[Decode] OOM detected on rank {self.dp_rank}: {reason}")
         return batch
 
-    def update(self, batch: Batch):
+    def update(self, batch: Batch, post_decode_overhead_s: float = 0.0):
         self.scheduler.process_batch_result_decode(batch)
         finished_now = []
         for req_idx, req in enumerate(self.request_list):
             if req.max_new_tokens > 1 and req.request_id not in self.finished_req_ids:
-                if update_metrics(req, self.wall_time, req.arrive_time):
+                if update_metrics(req, self.wall_time, req.arrive_time, post_decode_overhead_s=post_decode_overhead_s):
                     self.finished_req_ids.add(req.request_id)
                     finished_now.append(req)
         return finished_now
@@ -377,6 +379,7 @@ def run_simulation_disagg_aligned(
     pp: int = 1,
     dp: Tuple[int, int] = (1, 1),
     mem_fraction_static: float = 0.9,
+    post_decode_overhead_ms: float = 0.0,
 ):
     """Two-phase sim: prefill then decode with ready-time arrivals."""
     workers_pq = PriorityQueue()
@@ -418,6 +421,7 @@ def run_simulation_disagg_aligned(
 
     all_workers = prefill_workers + decode_workers
     finished_req_ids = set()
+    post_decode_overhead_s = post_decode_overhead_ms / 1000.0
     while True:
         current_global_time = max([w.wall_time for w in all_workers]) if all_workers else 0.0
         new_reqs = request_source.refresh(current_global_time, disaggregation=True)
@@ -435,8 +439,6 @@ def run_simulation_disagg_aligned(
         worker.queued = False
         if worker.complete:
             continue
-        if worker.step > 10000:
-            raise RuntimeError("Dead Loop")
         if abs(worker.wall_time - wall_time) > 1e-9:
             logger.debug(
                 f"[PQDrift] worker={worker.dp_rank}, pq_wall_time={wall_time:.5f}, "
@@ -444,8 +446,7 @@ def run_simulation_disagg_aligned(
             )
         logger.debug(f"Worker Rank: {worker.dp_rank}, Step: {worker.step}, Wall Time: {wall_time}")
         if worker.dp_rank.find("prefill") != -1: # Prefill
-            worker.fetch_new_request()
-            worker.process_prealloc_queue(decode_workers)
+            worker.fetch_new_request(decode_workers)
             worker.forward(ross_models)
             current_complete = worker.update()
             if current_complete:
@@ -457,36 +458,23 @@ def run_simulation_disagg_aligned(
                     decode_workers[rank].add_complete_event(complete_time, reqs)
                     enqueue_worker(decode_workers[rank])
         else:
-            prev_wall_time = worker.wall_time
             worker.fetch_new_request()
             batch = worker.forward(ross_models)
             if batch is not None:
-                finished_now = worker.update(batch)
+                finished_now = worker.update(batch, post_decode_overhead_s=post_decode_overhead_s)
                 for req in finished_now:
                     finished_req_ids.add(req.request_id)
-                    request_source.record_finish(req.request_id, worker.wall_time)
-            if worker.wall_time > prev_wall_time or batch is not None:
-                for prefill_worker in prefill_workers:
-                    if prefill_worker.is_blocked_on_decode():
-                        enqueue_worker(prefill_worker)
+                    request_source.record_finish(req.request_id, worker.wall_time + post_decode_overhead_s)
 
-        if not worker.complete and not (
-            worker.dp_rank.find("prefill") != -1 and worker.is_blocked_on_decode()
-        ):
+        if not worker.complete:
             enqueue_worker(worker)
             if worker.dp_rank.find("prefill") != -1:
                 logger.debug(
                     f"[PrefillRequeue] worker={worker.dp_rank}, wall_time={worker.wall_time:.5f}, "
-                    f"pending={len(worker.pending_reqs)}, prealloc={len(worker.prealloc_queue)}, "
+                    f"pending={len(worker.pending_reqs)}, "
                     f"waiting={len(worker.scheduler.waiting_queue)}"
                 )
         else:
-            if worker.dp_rank.find("prefill") != -1 and worker.is_blocked_on_decode():
-                logger.debug(
-                    f"[PrefillBlocked] worker={worker.dp_rank}, wall_time={worker.wall_time:.5f}, "
-                    f"prealloc={len(worker.prealloc_queue)}, pending={len(worker.pending_reqs)}, "
-                    f"waiting={len(worker.scheduler.waiting_queue)}"
-                )
             logger.debug(f"Worker {worker.dp_rank} complete at wall_time={worker.wall_time:.2f}")
 
     request_list = request_source.as_list()
@@ -748,19 +736,28 @@ def run_simulation_disagg_sequential(
     })
     return result_dict
 
-def run_sim(args, trace_configs = None):
+def run_sim(args):
     scheduler_kwargs = {
         "chunked_prefill_size": args.chunked_prefill_size,
         "reserved_decode_tokens": args.reserved_decode_tokens,
         "max_running_requests": args.batch_size,
     }
-    platform_perf = PlatformPerf(platform_perf_yaml=args.platform_perf)
+    use_cache = getattr(args, "cache_worker_config", False)
+    platform_perf = (
+        get_cached_platform_perf(args.platform_perf)
+        if use_cache
+        else PlatformPerf(platform_perf_yaml=args.platform_perf)
+    )
 
     def _init_worker_config(tp_size: int, pp_size: int, model_path: Dict[str, str]):
-        inference_config = InferenceConfig( tp_size=tp_size, pp_size=pp_size, )
+        inference_config = InferenceConfig(tp_size=tp_size, pp_size=pp_size)
         model = get_model(args.model_uri, inference_config)
-        ross_model_dict = get_ross_models(model, platform_perf, inference_config,
-                            model_path=model_path)
+        ross_model_dict = get_ross_models(
+            model,
+            platform_perf,
+            inference_config,
+            model_path=model_path,
+        )
         return model, ross_model_dict, inference_config
 
     request_store = VirtualClientStore(
@@ -774,24 +771,42 @@ def run_sim(args, trace_configs = None):
     if not args.disaggregation:
         exit(1)
     else:
-        prefill_model, prefill_ross_model_dict, _ = _init_worker_config(
-            tp_size=args.prefill_tp_size,
-            pp_size=args.prefill_pp_size,
-            model_path={
-                "prefill_pre_forward": args.prefill_pre_forward_path,
-                "prefill_forward": args.prefill_forward_path,
-                "prefill_post_forward": args.prefill_post_forward_path,
-            }
-        )
-        decode_model, decode_ross_model_dict, _ = _init_worker_config(
-            tp_size=args.decode_tp_size,
-            pp_size=1,
-            model_path={
-                "decode_pre_forward": args.decode_pre_forward_path,
-                "decode_forward": args.decode_forward_path,
-                "decode_post_forward": args.decode_post_forward_path,
-            }
-        )
+        prefill_model_path = {
+            "prefill_pre_forward": args.prefill_pre_forward_path,
+            "prefill_forward": args.prefill_forward_path,
+            "prefill_post_forward": args.prefill_post_forward_path,
+        }
+        decode_model_path = {
+            "decode_pre_forward": args.decode_pre_forward_path,
+            "decode_forward": args.decode_forward_path,
+            "decode_post_forward": args.decode_post_forward_path,
+        }
+        if use_cache:
+            prefill_model, prefill_ross_model_dict, _ = get_cached_worker_config(
+                model_uri=args.model_uri,
+                platform_perf_yaml=args.platform_perf,
+                tp_size=args.prefill_tp_size,
+                pp_size=args.prefill_pp_size,
+                model_path=prefill_model_path,
+            )
+            decode_model, decode_ross_model_dict, _ = get_cached_worker_config(
+                model_uri=args.model_uri,
+                platform_perf_yaml=args.platform_perf,
+                tp_size=args.decode_tp_size,
+                pp_size=1,
+                model_path=decode_model_path,
+            )
+        else:
+            prefill_model, prefill_ross_model_dict, _ = _init_worker_config(
+                tp_size=args.prefill_tp_size,
+                pp_size=args.prefill_pp_size,
+                model_path=prefill_model_path,
+            )
+            decode_model, decode_ross_model_dict, _ = _init_worker_config(
+                tp_size=args.decode_tp_size,
+                pp_size=1,
+                model_path=decode_model_path,
+            )
         ross_model_dict = { **prefill_ross_model_dict, **decode_ross_model_dict }
 
         ret = run_simulation_disagg_aligned(
@@ -809,6 +824,7 @@ def run_sim(args, trace_configs = None):
             
             dp=(args.prefill_dp_size, args.decode_dp_size),
             pp=args.prefill_pp_size,
+            post_decode_overhead_ms=getattr(args, "post_decode_overhead_ms", 0.0),
         )
         ret.update({
             "prefill_dp": args.prefill_dp_size,

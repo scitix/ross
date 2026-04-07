@@ -9,7 +9,7 @@ import plotext
 import math
 import os
 
-from pareto.inference_session import InferenceSession, DisaggInferenceSession
+from pareto.inference_session import InferenceSession
 from pareto.inference_summary import SummaryColumns, DisaggPrintedColumns, ColocatePrintedColumns
 from common.config import InferenceConfig, RuntimeConfig
 from common.models import get_model
@@ -64,35 +64,28 @@ def coloation_pareto(
         results_df: dataframe of the results
     """
     results_df = pd.DataFrame(columns=SummaryColumns)
-    if parallel_config.find("@") == -1: # pd correlation
-        dp_size, pp_size, tp_size = parallel_config.split(":")
-        
-        inference_config = InferenceConfig( dp_size=int(dp_size), pp_size=int(pp_size), tp_size=int(tp_size) )
-        sess = InferenceSession(model_uri=model_uri, backend=backend)
-    else:
-        p_config, d_config = parallel_config.split("@")
-        prefill_dp_size, prefill_pp_size, prefill_tp_size = p_config.split(":")
-        decode_dp_size,  decode_pp_size,  decode_tp_size = d_config.split(":")
+    sess = InferenceSession(model_uri=model_uri, backend=backend)
 
-        prefill_inference_config = InferenceConfig( dp_size=int(prefill_dp_size), pp_size=int(prefill_pp_size), tp_size=int(prefill_tp_size) )
-        decode_inference_config = InferenceConfig( dp_size=int(decode_dp_size), pp_size=int(decode_pp_size), tp_size=int(decode_tp_size) )
-        sess = DisaggInferenceSession(model_uri=model_uri, backend=backend)
+    is_disagg = "@" in parallel_config
+    if is_disagg:
+        p_config, d_config = parallel_config.split("@")
+        prefill_dp, prefill_pp, prefill_tp = p_config.split(":")
+        decode_dp,  decode_pp,  decode_tp  = d_config.split(":")
+        call_kwargs = dict(
+            prefill_inference_config=InferenceConfig(dp_size=int(prefill_dp), pp_size=int(prefill_pp), tp_size=int(prefill_tp)),
+            decode_inference_config =InferenceConfig(dp_size=int(decode_dp),  pp_size=int(decode_pp),  tp_size=int(decode_tp)),
+        )
+    else:
+        dp, pp, tp = parallel_config.split(":")
+        call_kwargs = dict(inference_config=InferenceConfig(dp_size=int(dp), pp_size=int(pp), tp_size=int(tp)))
+
     try:
-        if parallel_config.find("@") == -1: # pd correlation
-            summary = sess.find_best_result_under_constraints(
-                inference_config=inference_config,
-                runtime_config=runtime_config,
-                top_k=10,
-                gpu=gpu,
-            )
-        else:
-            summary = sess.find_best_result_under_constraints(
-                prefill_inference_config=prefill_inference_config,
-                decode_inference_config=decode_inference_config,
-                runtime_config=runtime_config,
-                top_k=10,
-                gpu=gpu,
-            )
+        summary = sess.find_best_result_under_constraints(
+            runtime_config=runtime_config,
+            top_k=10,
+            gpu=gpu,
+            **call_kwargs,
+        )
         result_df = summary.get_summary_df()
         print(result_df)
         if len(result_df) == 0:

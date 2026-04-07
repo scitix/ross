@@ -1,14 +1,14 @@
 {
     "backend": ["sglang"],
-    "backend_opts": [["H200", "0.5.6"]],
+    "platforms": [{"gpu": "H200", "version": "0.5.6"}],
     "model": ["Meta-Llama-3.1-70B"],
     "mode": "online",
-    "parallel": ["1:1:4@1:1:4"],
+    "parallel": ["1:1:8", "1:1:4@1:1:4"],
     "batch": [256],
+    "num_prompt": 512,
     "inputs": ["sharegpt@500_2500"],
     "output": "~/.etc",
     "datapath": "~/.etc",
-    "worker": [],
     "ross_extra": [
         {
             "backend": "sglang",

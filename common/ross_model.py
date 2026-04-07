@@ -15,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 from common.models import BaseModel
 from common.config import InferenceConfig
-from common.features import PlatformPerf, RegressionFeatures
+from common.features import PlatformPerf, RegressionFeatures, SGLRegressionFeatures
 
 # from scheduler_impl import SchedulerOutputForRegression
 
@@ -100,6 +100,35 @@ class ROSSModel:
         )
         return feature_vals
 
+    def _run_prediction(self, feature_vals, extra: dict = None) -> float:
+        """Build input vector, run the regressor, and return the clamped result.
+
+        Args:
+            feature_vals: A features dataclass with a `.platform_perf` attribute.
+            extra: Optional mapping of feature-column-name → scalar value for any
+                   columns not present on *feature_vals* (e.g. ``{"isl": 512, "osl": 128}``).
+        """
+        input_vector = []
+        feature_dict = {}
+        extra = extra or {}
+        for col in self.regression_metadata["feature_names"]:
+            if col.startswith("platform_") or col.startswith("theoretical_"):
+                val = getattr(feature_vals.platform_perf, col)
+            elif col in extra:
+                val = extra[col]
+            else:
+                val = getattr(feature_vals, col)
+            feature_dict[col] = val
+            input_vector.append(val)
+
+        input_array = np.array(input_vector).reshape(1, -1)
+        if self.regression_metadata["scale_needed"]:
+            scaler = StandardScaler()
+            input_array = scaler.fit_transform(input_array)
+
+        prediction = self.regression_model.predict(input_array)
+        return max(float(prediction[0]), 0)
+
     def predict(self, req_ids: List[str],
                     prefill_seq_lens: List[int],
                     decode_seq_lens: List[int],
@@ -113,37 +142,28 @@ class ROSSModel:
 
         Returns:
             A tuple of (time_step, forward_overhead).
-        """        
+        """
         if not req_ids:
             return 0
-        # Step 1: Extract features from the scheduler outputV
-        input_vector = []
-        feature_dict = {}
         feature_vals = self._extract_features(req_ids, prefill_seq_lens, decode_seq_lens)
-        for col in self.regression_metadata["feature_names"]:
-            if col.startswith("platform_") or col.startswith('theoretical_'):
-                feature_dict[col] = getattr(feature_vals.platform_perf, col)
-                input_vector.append(getattr(feature_vals.platform_perf, col))
-            # For pre-forward, isl & osl needed
-            elif col == 'isl':
-                feature_dict[col] = isl
-                input_vector.append(isl)
-            elif col == 'osl':
-                feature_dict[col] = osl
-                input_vector.append(osl)
-            else:
-                feature_dict[col] = getattr(feature_vals, col)
-                input_vector.append(getattr(feature_vals, col))
-        
-        # logger.debug(f"Feature Dict: {feature_dict}")
-        input_array = np.array(input_vector).reshape(1, -1)
+        return self._run_prediction(feature_vals, extra={"isl": isl, "osl": osl})
 
-        # check if scale needed
-        if self.regression_metadata["scale_needed"] == True:
-            scaler = StandardScaler()
-            input_array = scaler.fit_transform(input_array)
 
-        # Step 4: Perform prediction
-        prediction = self.regression_model.predict(input_array)
-        
-        return max(float(prediction[0]), 0)
+class SGLROSSModel(ROSSModel):
+
+    def _extract_features(self,
+                          req_ids: List[str],
+                          seq_lens: List[int]) -> SGLRegressionFeatures:
+        return SGLRegressionFeatures(
+            batch_size=len(req_ids),
+            seq_lens=seq_lens,
+            model=self.model,
+            inference_config=self.inference_config,
+            platform_perf=self.platform_perf,
+        )
+
+    def predict(self, req_ids: List[str], seq_lens: List[int]) -> float:
+        if not req_ids:
+            return 0
+        feature_vals = self._extract_features(req_ids, seq_lens)
+        return self._run_prediction(feature_vals)

@@ -61,22 +61,25 @@ def _resolve_tokenization(rid: int, text: str) -> int:
 
 def call_bench_serving(model, framework, dataset_name, dataset, isl, osl, rate, num_prompt, req_output, batch_size):
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    ross_dir = os.path.dirname(script_dir)  # ross/ (parent of servers/)
     log_dir = os.path.join(script_dir, "log")
     os.makedirs(log_dir, exist_ok=True)
     subprocess.run(
-        ["./ross_launch_server.sh", model, framework, 
-        dataset_name, dataset, isl, osl, rate, num_prompt, req_output,
-        os.path.join(log_dir, "launch_server.log"),
-        os.path.join(log_dir, "client.log"),
-        os.path.join(log_dir, "client_bench.log"),
-        batch_size],
+        [os.path.join(ross_dir, "ross_launch_server.sh"), model, framework,
+         dataset_name, dataset, isl, osl, rate, num_prompt, req_output,
+         os.path.join(log_dir, "launch_server.log"),
+         os.path.join(log_dir, "client.log"),
+         os.path.join(log_dir, "client_bench.log"),
+         batch_size],
         text=True,
-        check=True
+        check=True,
+        cwd=ross_dir,
     )
 
 def _append_log(entry: Dict[str, Any]) -> None:
     if not log_path:
         return
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 

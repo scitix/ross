@@ -46,12 +46,12 @@ bench_setup_server(){
     rm_if_exists "${client_bench_log}"
     rm_if_exists "${tokenize_log}"
 
-    tokenize_args="cd ${SCRIPT_DIR} && python3 tokenize_server.py --host 127.0.0.1 --port=8001 --model ${model}"
+    tokenize_args="cd ${SCRIPT_DIR}/servers && python3 tokenize_server.py --host 127.0.0.1 --port=8001 --model ${model}"
     echo_back "${tokenize_args} > ${tokenize_log} 2>&1 &"
     tokenize_pid=$!
     sleep 2
-    
-    server_args="cd ${SCRIPT_DIR} && python3 api_server.py --host 127.0.0.1 --port=8000 --log-file ${arrive_json_log} --model ${model} --bootstrap-remote-count ${batch_size}"
+
+    server_args="cd ${SCRIPT_DIR}/servers && python3 api_server.py --host 127.0.0.1 --port=8000 --log-file ${arrive_json_log} --model ${model} --bootstrap-remote-count ${batch_size}"
     if [[ $framework == 'sglang' ]]; then
         server_args="${server_args} --tokenize-url http://127.0.0.1:8001/tokenize"
     fi
@@ -61,8 +61,8 @@ bench_setup_server(){
     echo_back "${server_args} > ${launch_server_log} 2>&1 &"
     sv_pid=$!
     sleep 2
-    
-    client_args="python3 bench_serving.py --backend=sglang --num-prompts=${num_prompt} --max-concurrency=${batch_size}"
+
+    client_args="cd ${SCRIPT_DIR}/servers && python3 bench_serving.py --backend=sglang --num-prompts=${num_prompt} --max-concurrency=${batch_size}"
     client_args="${client_args} --model=${model} --dataset-name=${dataset_name} --dataset-path=${dataset}"
     client_args="${client_args} --host=127.0.0.1 --port=8000"
     client_args="${client_args} --sharegpt-prompt-len ${isl} --sharegpt-output-len ${osl} --request-rate=${rate}"

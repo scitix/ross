@@ -8,7 +8,7 @@ from pathlib import Path
 from queue import PriorityQueue
 from typing import Any, Dict, List
 
-TEST_ROOT = Path(__file__).resolve().parents[1]
+TEST_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TEST_ROOT))
 
 from common.config import InferenceConfig
@@ -16,14 +16,16 @@ from common.features import PlatformPerf
 from common.kvpool import KVCachePool
 from common.models import get_model
 from common.ross_model import ROSSModel
-from common.sim_transport import VirtualClientStore
+from common.sim_http_perf import VirtualClientStore
 
 from scheduler.request import Request, RequestStatus
 from scheduler.scheduler import Scheduler, SchedulerOutput
 
 from simulator_main import (
+    get_ross_model_paths,
     calulcate_benchmark_results,
     check_pipeline_clear,
+    get_regression_model,
     get_ross_models,
     load_memory_increase,
     parse_args,
@@ -32,6 +34,17 @@ from simulator_main import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _snapshot_worker_state(worker: "BaseWorker") -> tuple:
+    return (
+        worker.wall_time,
+        len(worker.pending_reqs),
+        len(worker.active_reqs),
+        len(worker.scheduler.waiting),
+        len(worker.scheduler.running),
+        worker.scheduler.kv_cache_manager.num_free_blocks,
+    )
 
 
 class BaseWorker:
@@ -61,6 +74,9 @@ class BaseWorker:
             return self.rank_id < other.rank_id
         return self.wall_time < other.wall_time
 
+    def next_wakeup_time(self) -> float | None:
+        return None
+
 
 class PrefillWorker(BaseWorker):
     def __init__(self, rank_id: int, scheduler: Scheduler, pp: int):
@@ -75,6 +91,11 @@ class PrefillWorker(BaseWorker):
             return
         self.pending_reqs.extend(reqs)
         self.complete = False
+
+    def next_wakeup_time(self) -> float | None:
+        if not self.pending_reqs:
+            return None
+        return self.pending_reqs[0].ready_time
 
     def fetch_new_requests(self) -> None:
         while self.pending_reqs and self.pending_reqs[0].ready_time <= self.wall_time:
@@ -101,7 +122,8 @@ class PrefillWorker(BaseWorker):
         if schedule_output and (not self.scheduler.should_terminate()):
             self.scheduler.debug_print_schedule(schedule_output, self.rank_id, self.step)
             for name in ["pre_forward", "forward", "post_forward"]:
-                _time_step = ross_models[name].predict(
+                regression_model = get_regression_model(ross_models, name, "prefill")
+                _time_step = regression_model.predict(
                     req_ids=schedule_output.scheduled_req_ids,
                     prefill_seq_lens=schedule_output.prefill_seq_lens,
                     decode_seq_lens=schedule_output.decode_seq_lens,
@@ -126,7 +148,7 @@ class PrefillWorker(BaseWorker):
             if not req.prefill_end_time and req.output_len == 1:
                 req.prefill_end_time = self.wall_time
                 req.status = RequestStatus.FINISHED
-                self.scheduler.kv_cache_manager.free(req)
+                self.scheduler.kv_cache_manager.free(req.request_id)
                 completed.append(req)
                 self.active_reqs.pop(rid, None)
         self.scheduler.running = [req for req in self.scheduler.running if req.status != RequestStatus.FINISHED]
@@ -145,6 +167,11 @@ class DecodeWorker(BaseWorker):
             return
         self.pending_reqs.extend(reqs)
         self.complete = False
+
+    def next_wakeup_time(self) -> float | None:
+        if not self.pending_reqs:
+            return None
+        return self.pending_reqs[0].prefill_end_time
 
     def fetch_new_requests(self) -> None:
         while self.pending_reqs and self.pending_reqs[0].prefill_end_time <= self.wall_time:
@@ -173,7 +200,8 @@ class DecodeWorker(BaseWorker):
         if schedule_output and (not self.scheduler.should_terminate()):
             self.scheduler.debug_print_schedule(schedule_output, self.rank_id, self.step)
             for name in ["pre_forward", "forward", "post_forward"]:
-                _time_step = ross_models[name].predict(
+                regression_model = get_regression_model(ross_models, name, "decode")
+                _time_step = regression_model.predict(
                     req_ids=schedule_output.scheduled_req_ids,
                     prefill_seq_lens=schedule_output.prefill_seq_lens,
                     decode_seq_lens=schedule_output.decode_seq_lens,
@@ -286,6 +314,7 @@ def run_simulation_disagg_aligned(
         if worker.complete:
             continue
 
+        prev_state = _snapshot_worker_state(worker)
         logger.debug(f"Worker Rank: [{worker.worker_type}] {worker.rank_id}, Step: {worker.step}, Wall Time: {worker.wall_time}")
         if worker.worker_type == "prefill":
             worker.fetch_new_requests()
@@ -298,8 +327,8 @@ def run_simulation_disagg_aligned(
                     finished_req_ids.add(req.request_id)
                     request_source.record_finish(req.request_id, req.prefill_end_time)
                     continue
-                req.decode_dp_rank = (global_dp_assign_idx // req_batch) % dp
-                global_dp_assign_idx += 1
+                req.decode_dp_rank = (worker.decode_assign_idx // req_batch) % dp
+                worker.decode_assign_idx += 1
                 decode_reqs_by_rank.setdefault(req.decode_dp_rank, []).append(req)
             for rank, reqs in decode_reqs_by_rank.items():
                 decode_workers[rank].add_requests(reqs)
@@ -311,6 +340,34 @@ def run_simulation_disagg_aligned(
             for req in finished:
                 request_source.record_finish(req.request_id, worker.wall_time)
                 finished_req_ids.add(req.request_id)
+
+        curr_state = _snapshot_worker_state(worker)
+        if (
+            not worker.complete
+            and worker.batch_pipeline
+            and worker.batch_pipeline[-1] is None
+            and curr_state == prev_state
+        ):
+            if curr_state[1:5] == (0, 0, 0, 0):
+                worker.complete = True
+            else:
+                next_wakeup_time = worker.next_wakeup_time()
+                if (
+                    curr_state[2:5] == (0, 0, 0)
+                    and next_wakeup_time is not None
+                    and next_wakeup_time > worker.wall_time
+                ):
+                    worker.wall_time = next_wakeup_time
+                else:
+                    raise RuntimeError(
+                        "Aligned vLLM simulator made no progress for worker "
+                        f"{worker.worker_type}[{worker.rank_id}] at step={worker.step}. "
+                        f"state=(wall_time={worker.wall_time}, pending={len(worker.pending_reqs)}, "
+                        f"active={len(worker.active_reqs)}, waiting={len(worker.scheduler.waiting)}, "
+                        f"running={len(worker.scheduler.running)}, "
+                        f"free_blocks={worker.scheduler.kv_cache_manager.num_free_blocks}, "
+                        f"next_wakeup_time={next_wakeup_time})"
+                    )
 
         if not worker.complete:
             enqueue_worker(worker)
@@ -338,10 +395,7 @@ def run_simulation_disagg_aligned(
     result_dict = {
         "duration": max_wall_time,
         **benchmarks,
-        "prefill_result": {
-            "wall_time": max((w.wall_time for w in prefill_workers), default=0.0),
-            "timing_phases": [w.timing_phases for w in prefill_workers],
-        },
+        "prefill_phases": [w.timing_phases for w in prefill_workers],
         "decode_phases": [w.timing_phases for w in decode_workers],
     }
     result_dict.update({
@@ -352,9 +406,9 @@ def run_simulation_disagg_aligned(
     return result_dict
 
 
-def run_sim(args, trace_configs=None):
+def run_sim(args):
     if not args.disaggregation:
-        return legacy_run_sim(args, trace_configs)
+        return legacy_run_sim(args)
 
     scheduler_kwargs = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
@@ -372,11 +426,7 @@ def run_sim(args, trace_configs=None):
             model,
             platform_perf,
             infer_config,
-            model_path={
-                "pre_forward": getattr(args, "pre_forward_path"),
-                "forward": getattr(args, "forward_path"),
-                "post_forward": getattr(args, "post_forward_path"),
-            },
+            model_path=get_ross_model_paths(args),
         )
         return model, ross_model_dict
 

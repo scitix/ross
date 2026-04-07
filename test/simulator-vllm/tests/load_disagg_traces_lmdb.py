@@ -20,7 +20,7 @@ PROFILING_KEYS = [
 # Main execution block
 # ==============================================================================
 
-def load_traces(args, debug=False, skip_timing=True, stage_name = '', req_name = None):
+def load_traces(args, debug=False, stage_name = '', req_name = None):
     def _calc_execution_timing(rank, data_per_round, req_name, f = None):
         result = {
             "pre_time": 0,
@@ -78,27 +78,42 @@ def load_traces(args, debug=False, skip_timing=True, stage_name = '', req_name =
         return result, avail_tokens, req_assignment
 
     rank_logs = list(args[f"{stage_name}_rank_logs"])
+    main_server_log = args["prefill_server_log"]
     main_client_log = args[f"client_log"]
 
     if not main_client_log:
         raise RuntimeError("No trace logs found.")
+    print(f"[trace] loading client log: {main_client_log}")
 
     bench_results = get_bench_results(main_client_log)
+    ttft = dict()
+    ttft_stages = dict()
+    prompt_tokens = dict()
     if not req_name:
-        req_name, req_name_set = dict(), []
+        req_name = dict()
         for rank_log in rank_logs:
-            req_name_rank, _ = get_req_names(rank_log)
-            req_name_set.extend(req_name_rank)
-        for req_id in req_name_set:
-            if req_id not in req_name:
-                req_name[req_id] = f"req_{len(req_name.values())}"
+            req_name_rank, prompt_tokens_rank, ttft_rank, ttft_stages_rank = get_req_names(rank_log, main_server_log)
+            prompt_tokens.update(prompt_tokens_rank)
+
+            for req_id in req_name_rank:
+                if req_id not in req_name:
+                    req_name[req_id] = f"req_{len(req_name.values())}"
+                if ttft_rank != {} and req_id in ttft_rank:
+                    ttft[req_name[req_id]] = ttft_rank[req_id]
+                if ttft_stages_rank != {} and req_id in ttft_stages_rank:
+                    ttft_stages[req_name[req_id]] = ttft_stages_rank[req_id]
+
+    if ttft:
+        bench_results["server_ttft_ms_by_req"] = ttft
+    if ttft_stages:
+        bench_results["server_ttft_stages_ms_by_req"] = ttft_stages
 
     max_rank_time, max_rank = 0, 0
     max_decode_data, flog, max_tps = None, None, None
     if debug:
         flog = open(f'log/vllm_{stage_name}outputs.log', 'w')
 
-    if not skip_timing:
+    if debug:
         calculated_dp_rank = {}
         bench_results["staged_timing_data"] = []
         for rank_id, rank in enumerate(rank_logs):
@@ -117,30 +132,11 @@ def load_traces(args, debug=False, skip_timing=True, stage_name = '', req_name =
                 max_tps = f"{params['dp']}:{params['pp']}:{params['tp']}"
         
         if not max_decode_data:
-            return bench_results
-        timing_data, _ = calc_execution_timing(max_rank, max_decode_data, req_name, flog)
+            return bench_results, req_name
+        timing_data, _ = calc_execution_timing(max_rank, max_decode_data, req_name, prompt_tokens, ttft, f=flog)
         timing_data.update({ "result_dp_rank": max_rank })
         
         bench_results.update({'tps': max_tps})
         bench_results.update( {"staged_timing_data": timing_data })   
 
     return bench_results, req_name
-
-# if __name__ == '__main__':
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--log_file", type=str, help=f"Path to the VLLM scheduler log file to be analyzed.")
-#     parser.add_argument("--request-rate", type=str, help=f"num_reqs / s")
-#     parser.add_argument("--osl", type=int, help=f"osl")
-#     parser.add_argument("--disaggregation", action='store_true')
-
-#     args = parser.parse_args()
-#     req_name = None
-#     prefill_results, req_name, prefill_as = load_traces(args, debug=True, stage_name='prefill', req_name=req_name)
-#     vllm_results, req_name, decode_as = load_traces(args, debug=True, stage_name='decode', req_name=req_name)
-#     vllm_results.update({ "prefill_phase": prefill_results })
-#     print(f"vllm results: {vllm_results}")
-
-#     # Assignment
-#     with open('./tests/request_assignment.json', 'w') as fout:
-#         req_as = { "prefill": prefill_as, "decode": decode_as }
-#         json.dump(req_as, fout)
