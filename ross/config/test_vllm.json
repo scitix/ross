@@ -1,14 +1,15 @@
 {
     "backend": ["vllm"],
-    "platforms": [{"gpu": "H200", "version": "0.11.2"}],
-    "model": ["Meta-Llama-3.1-70B"],
+    "platforms": [{"gpu": "B200", "version": "0.11.2"}],
+    "model": ["Qwen3-30B-A3B"],
     "mode": "online",
     "parallel": ["1:1:8", "1:1:4@1:1:4"],
     "batch": [256],
     "num_prompt": 512,
-    "inputs": ["sharegpt@500_2500"],
+    "inputs": ["sharegpt@2500_2500"],
     "output": "~/.etc",
     "datapath": "~/.etc",
+    "model_search_paths": "/models",
     "ross_extra": [
         {
             "backend": "vllm",

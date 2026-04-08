@@ -67,6 +67,10 @@ def _task_brief(task: "SimulationTask") -> str:
     )
 
 
+def _debug_phase_dump(task: "SimulationTask", phase_name: str, phase_data: Any) -> None:
+    print(f"[eval-debug] {_task_brief(task)} {phase_name}={phase_data}", flush=True)
+
+
 def _set_thread_env(threads_per_worker: int) -> None:
     value = str(max(1, threads_per_worker))
     os.environ["OMP_NUM_THREADS"] = value
@@ -268,12 +272,12 @@ def run_single_sim(task: "SimulationTask") -> tuple:
         if task.debug:
             if "@" in task.parallel:
                 if "prefill_phases" in sim_result_dict:
-                    print(sim_result_dict["prefill_phases"])
+                    _debug_phase_dump(task, "prefill_phases", sim_result_dict["prefill_phases"])
                 if "decode_phases" in sim_result_dict:
-                    print(sim_result_dict["decode_phases"])
+                    _debug_phase_dump(task, "decode_phases", sim_result_dict["decode_phases"])
             else:
                 if "timing_phases" in sim_result_dict:
-                    print(sim_result_dict["timing_phases"])
+                    _debug_phase_dump(task, "timing_phases", sim_result_dict["timing_phases"])
 
         _log(
             f"[task-done] pid={os.getpid()} {_task_brief(task)} "
@@ -595,7 +599,7 @@ def main():
                 for parallel in conf.parallel:
                     for batch in conf.batches:
                         for rate in conf.rates:
-                            conf.set_curr(backend, model, parallel, batch, inp)
+                            conf.set_curr(backend, model, parallel, batch, inp, platform)
 
                             # Arrival file (shared)
                             arrival_dir = os.path.abspath(f"arrivals/{backend}")

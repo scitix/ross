@@ -16,16 +16,15 @@ logger = logging.getLogger(__name__)
 
 def _resolve_sgl_model_paths(modeling_dir: str, moe: bool) -> dict:
     """Build xgboost model path dict from a single modeling_dir root."""
-    tag     = "moe" if moe else "dense"
-    fwd_dir = "moe_foward" if moe else "dense_forward"   # preserve upstream typo
+    fwd_dir = "moe_foward" if moe else "dense"   # preserve upstream typo
     base    = Path(modeling_dir) / "sgl"
     return {
-        "prefill_pre_forward_path":  str(base / f"{tag}_pre/prefill/pre_forward_trained_models/xgboost_model"),
-        "decode_pre_forward_path":   str(base / f"{tag}_pre/decode/pre_forward_trained_models/xgboost_model"),
+        "prefill_pre_forward_path":  str(base / f"dense/prefill/pre_forward_trained_models/xgboost_model"),
+        "decode_pre_forward_path":   str(base / f"dense/decode/pre_forward_trained_models/xgboost_model"),
         "prefill_forward_path":      str(base / f"{fwd_dir}/prefill/forward_trained_models/xgboost_model"),
         "decode_forward_path":       str(base / f"{fwd_dir}/decode/forward_trained_models/xgboost_model"),
-        "prefill_post_forward_path": str(base / "dense_post/post_forward_trained_models/xgboost_model"),
-        "decode_post_forward_path":  str(base / "dense_post/post_forward_trained_models/xgboost_model"),
+        "prefill_post_forward_path": str(base / "dense/post_forward_trained_models/xgboost_model"),
+        "decode_post_forward_path":  str(base / "dense/post_forward_trained_models/xgboost_model"),
     }
 
 def bench_online(

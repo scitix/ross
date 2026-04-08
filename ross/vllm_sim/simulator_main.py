@@ -28,6 +28,21 @@ from scheduler.scheduler import Scheduler, SchedulerOutput
 import logging
 logger = logging.getLogger(__name__)
 
+
+def _warn_pp_pre_forward_disabled(args) -> None:
+    has_explicit_deprecated_path = bool(getattr(args, "_explicit_pp_pre_forward_path", False))
+    if getattr(args, "pp_size", 1) > 1:
+        print(
+            "[warning] vLLM pp>1 currently does not support pp_pre_model; "
+            "pp_pre_forward is forced to 0 and --pp_pre_forward_path is ignored.",
+            flush=True,
+        )
+    elif has_explicit_deprecated_path:
+        print(
+            "[warning] --pp_pre_forward_path is deprecated and ignored in vLLM simulation.",
+            flush=True,
+        )
+
 def parse_args():
     ap = argparse.ArgumentParser("ROSS VLLM simulator")
     ap.add_argument("--model-uri", type=str, default="")
@@ -60,14 +75,20 @@ def parse_args():
     ap.add_argument('--platform-perf', type=str, required=True, help='Path to the Platform Performance file.')
 
     ap.add_argument('--pre_forward_path', type=str, help='Path to the Saved PRE-FORWARD Model file.')
-    ap.add_argument('--pp_pre_forward_path', type=str, help='Path to the Saved PRE-FORWARD Model file on PP>1.')    
+    ap.add_argument(
+        '--pp_pre_forward_path',
+        type=str,
+        help='Deprecated. Ignored in vLLM simulation because pp_pre_model is not supported.',
+    )
 
     ap.add_argument('--forward_path', type=str, help='Path to the Saved [Prefill] FORWARD Model file.')
     ap.add_argument('--prefill_forward_path', type=str, help='Path to the Saved [Prefill] FORWARD Model file.')
     ap.add_argument('--decode_forward_path', type=str, help='Path to the Saved [Decode] FORWARD Model file.')
     ap.add_argument('--post_forward_path', type=str, help='Path to the Saved [Prefill] POST-FORWARD Model file.')
 
-    return ap.parse_args()
+    args = ap.parse_args()
+    args._explicit_pp_pre_forward_path = "--pp_pre_forward_path" in sys.argv
+    return args
 
 def get_ross_models(model: BaseModel,
                     platform_perf: PlatformPerf,
@@ -174,7 +195,6 @@ def run_simulation(
     batch_size: int,
     request_list: VirtualClientStore,
     ross_models: Dict[str, Any],
-    pp_pre_model: ROSSModel,
     scheduler_kwargs: Dict[str, Any],
     isl: int,
     osl: int,
@@ -308,11 +328,9 @@ def run_simulation(
         max_wall_time = max([s["wall_time"] for s in current_status])
     else:
         for dpi, status in enumerate(current_status):        
-            total_time_slices[dpi]['pp_pre_forward'] = pp_pre_model.predict(
-                req_ids=["req_id"] * batch_size,
-                prefill_seq_lens=[], decode_seq_lens=[0 for i in range(status['step'])],
-                isl=isl, osl=osl,
-            )
+            # PP pre-forward regression is temporarily disabled because there is
+            # no supported pp>1 model for this path yet.
+            total_time_slices[dpi]['pp_pre_forward'] = 0
             if pp > 1:
                 max_wall_time = max(max_wall_time, status["wall_time"] + total_time_slices[dpi]['pp_pre_forward'])
         # Refine TTFT and TTLT
@@ -363,6 +381,7 @@ def load_memory_increase(path: str, filters: Dict[str, Any]) -> Dict[str, float]
 
 
 def run_sim(args):    
+    _warn_pp_pre_forward_disabled(args)
     scheduler_kwargs = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
     }
@@ -390,13 +409,6 @@ def run_sim(args):
     if not args.disaggregation:
         memory_increase = load_memory_increase(args.mem_profiling_path, { "pp": args.pp_size, "tp": args.tp_size })
         model, ross_model_dict, _ = _init_worker_config(args)
-        pp_pre_model = ROSSModel(
-            saved_model_path=args.pp_pre_forward_path,
-            platform_perf=platform_perf,
-            model=model,
-            inference_config=model.inference_config,
-            regressor="xgboost",
-        )
         ret = run_simulation(
             model=model,
             batch_size=args.batch_size,
@@ -408,7 +420,6 @@ def run_sim(args):
             gpu_memory_utilization=args.gpu_memory_utilization,
 
             ross_models=ross_model_dict,
-            pp_pre_model=pp_pre_model,
             dp=args.dp_size, pp=args.pp_size,
             isl=args.max_prompt_len, osl=args.max_output_len,
         )
@@ -418,14 +429,6 @@ def run_sim(args):
         
         prefill_model, prefill_ross_model_dict, _ = _init_worker_config(args, "prefill_")
         decode_model, decode_ross_model_dict, _ = _init_worker_config(args, "decode_")
-        
-        pp_pre_model = ROSSModel(
-            saved_model_path=args.pp_pre_forward_path,
-            platform_perf=platform_perf,
-            model=decode_model,
-            inference_config=decode_model.inference_config,
-            regressor="xgboost",
-        )
 
         ret = run_disagg_simulation(
             prefill_model=prefill_model,
@@ -441,7 +444,6 @@ def run_sim(args):
 
             prefill_ross_models=prefill_ross_model_dict,
             decode_ross_models=decode_ross_model_dict,
-            pp_pre_model=pp_pre_model,
             dp=args.dp_size, pp=1,
             isl=args.max_prompt_len, osl=args.max_output_len,
         )

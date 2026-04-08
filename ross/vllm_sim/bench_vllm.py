@@ -19,10 +19,10 @@ def _resolve_vllm_model_paths(modeling_dir: str, moe: bool) -> dict:
     tag  = "moe" if moe else "dense"
     base = Path(modeling_dir) / "vllm"
     return {
-        "pp_pre_forward_path": str(base / "2_8_pp/pre_forward_trained_models/xgboost_model"),
-        "pre_forward_path":    str(base / f"{tag}/pre_forward_trained_models/xgboost_model"),
+        "pp_pre_forward_path": str(base / f"dense/pre_forward_trained_models/xgboost_model"),
+        "pre_forward_path":    str(base / f"dense/pre_forward_trained_models/xgboost_model"),
         "forward_path":        str(base / f"{tag}/forward_trained_models/xgboost_model"),
-        "post_forward_path":   str(base / f"{tag}/post_forward_trained_models/xgboost_model"),
+        "post_forward_path":   str(base / f"dense/post_forward_trained_models/xgboost_model"),
     }
 
 def bench_online(

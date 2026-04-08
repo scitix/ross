@@ -40,6 +40,7 @@ DEFAULT_RATE     = "inf"
 DEFAULT_INPUT    = "sharegpt@0_0"
 DEFAULT_RESERVE  = 0.9
 DEFAULT_CHUNK_PREFILL_SIZE = 8192
+DEFAULT_MODEL_SEARCH_PATHS = ["~/models"]
 
 def show_help():
     help_text = f"""
@@ -67,6 +68,7 @@ optional arguments:
                                Default: {DEFAULT_INPUT}
   --output OUTPUT_PATH     Path for benchmark logs and result outputs (default: ~/.etc).
   --datapath PATH          Absolute path to dataset directory (default: ~/.etc).
+  --model-search-paths     Comma-separated roots used to resolve model names when --model is not an absolute path.
 
   --worker WORKER_NAME     Comma-separated list of worker hostname for multi-machine benchmarks.
                            Not recommended to set manually. The runtime system will automatically select the appropriate machine
@@ -124,6 +126,7 @@ def generate_config_template(path="config_template.json"):
         "input":         DEFAULT_INPUT,
         "output":        str(Path(etcpath).expanduser().resolve()),
         "datapath":      str(Path(etcpath).expanduser().resolve()),
+        "model_search_paths": DEFAULT_MODEL_SEARCH_PATHS,
         "worker":        "",
 
         # special fields
@@ -170,7 +173,8 @@ class BenchmarkConfig:
         self.raw          = args
         self.backends     = self._split(args.backend)
         self.platforms    = None
-        self.models       = [util.get_model(m) for m in self._split(args.model)]
+        self.model_specs  = self._split(args.model)
+        self.models       = []
         self.mode         = args.mode
 
         self.disaggregation_mode = "colocation"
@@ -184,6 +188,7 @@ class BenchmarkConfig:
 
         self.output       = args.output
         self.datapath     = args.datapath
+        self.model_search_paths = self._as_list(args.model_search_paths) if getattr(args, "model_search_paths", None) else []
         self.override     = args.override
         self.quiet        = args.quiet
         self.validation   = args.validation
@@ -194,6 +199,7 @@ class BenchmarkConfig:
 
         self.apply_conf()
         self.apply_default()
+        self.models = [util.get_model(m, self.model_search_paths) for m in self.model_specs]
         self.post_init()
 
         self.check()
@@ -259,8 +265,8 @@ class BenchmarkConfig:
         self.test_venv, test_extra = None, None
     
     def apply_default(self):
-        if len(self.models) == 0:
-            self.models = [util.get_model(DEFAULT_MODELS)]
+        if len(self.model_specs) == 0:
+            self.model_specs = [DEFAULT_MODELS]
         if not self.mode:
             self.mode = DEFAULT_MODE
         if self.parallel is None:
@@ -277,6 +283,8 @@ class BenchmarkConfig:
             self.datapath =  str(Path(etcpath).expanduser().resolve())
         if not self.modeling_dir:
             self.modeling_dir = DEFAULT_MODELING_DIR
+        if not self.model_search_paths:
+            self.model_search_paths = list(DEFAULT_MODEL_SEARCH_PATHS)
         for key in self.args.keys():
             if len(self.args[key]) == 0:
                 self.args[key].append({})
@@ -298,9 +306,8 @@ class BenchmarkConfig:
             elif "backend_opts" in conf.keys():
                 # backward-compat: old list-of-arrays format [["H200", "0.5.6"]]
                 self.platforms = [{"gpu": p[0], "version": p[1]} for p in conf["backend_opts"]]
-            if len(self.models) == 0 and "model" in conf.keys():
-                models = self._as_list(conf["model"])
-                self.models = [util.get_model(m) for m in models]
+            if len(self.model_specs) == 0 and "model" in conf.keys():
+                self.model_specs = self._as_list(conf["model"])
             if not self.mode and "mode" in conf.keys():
                 self.mode = conf["mode"]
             if "disaggregation_mode" in conf.keys():
@@ -327,6 +334,10 @@ class BenchmarkConfig:
                 self.datapath = str(Path(conf["datapath"]).expanduser().resolve())
             if not self.modeling_dir and "modeling_dir" in conf.keys():
                 self.modeling_dir = str(Path(conf["modeling_dir"]).expanduser().resolve())
+            if not self.model_search_paths and "model_search_paths" in conf.keys():
+                self.model_search_paths = [
+                    str(Path(p).expanduser().resolve()) for p in self._as_list(conf["model_search_paths"])
+                ]
 
             if "env" in conf.keys():
                 self.envs.update(conf["env"])
@@ -518,7 +529,7 @@ class BenchmarkConfig:
             "osl": self._parse_len_range(osl_str),
         }
 
-    def set_curr(self, backend_, model_, parallel_, batch_, input = None):
+    def set_curr(self, backend_, model_, parallel_, batch_, input = None, platform = None):
         self.test_backend  = backend_
         self.test_model    = model_ 
         self.test_parallel = parallel_ 
@@ -526,7 +537,8 @@ class BenchmarkConfig:
         self.test_venv     = self.backend_info[backend_]["venv"]
         self.cur_test      = self.cur_test + 1
         
-        version            = self.backend_info[backend_]["version"]
+        target_gpu         = platform["gpu"] if platform else self.gpuname
+        version            = platform["version"] if platform else self.backend_info[backend_]["version"]
         if not input:
             dataset, isl, osl  = self.input["dataset"], self.input["isl"], self.input["osl"]
         else:
@@ -550,7 +562,7 @@ class BenchmarkConfig:
         #         res = extra_["gpu_memory_utilization"]
         #     if "disable_cuda_graph" in extra_.keys() or "enforce_eager" in extra_.keys():
         #         opt = "eag"
-        self.test_dst      = f"{self.output}/LMDB/{self.gpuname}/{self.mode}_{opt}_{res}_{backend_}_{version}/{model_name}_{datatype}_{parallel_}_batch_{batch_}"
+        self.test_dst      = f"{self.output}/LMDB/{target_gpu}/{self.mode}_{opt}_{res}_{backend_}_{version}/{model_name}_{datatype}_{parallel_}_batch_{batch_}"
         if self.num_prompt != 512:
             self.test_dst = self.test_dst + f"_promptnum_{self.num_prompt}"
         Path(self.test_dst).expanduser().resolve().mkdir(parents=True, exist_ok=True)
@@ -591,6 +603,7 @@ class BenchmarkConfig:
         s.append(f"       Inputs       : {[inp.get('dataset','?') + '@' + str(inp.get('isl',('?','?'))[0]) + '_' + str(inp.get('osl',('?','?'))[0]) for inp in self.inputs]}")
         s.append(f"       Output       : {self.output}")
         s.append(f"       Modeling dir : {self.modeling_dir}")
+        s.append(f"       Model search : {self.model_search_paths}")
         s.append(f"       Config       : {self.config}")
         # Scheduler args (only the current backend's params)
         for i, key in enumerate(self.args.keys()):
@@ -615,6 +628,7 @@ def build_parser():
     parser.add_argument("--datapath",   type=str,   help="Absolute path to dataset directory")
     parser.add_argument("--config",       type=str,   help="Path to JSON config file")
     parser.add_argument("--modeling-dir", type=str,   dest="modeling_dir", help=f"Path to modeling directory containing xgboost models (default: {DEFAULT_MODELING_DIR})")
+    parser.add_argument("--model-search-paths", type=str, dest="model_search_paths", help="Comma-separated model search roots used to resolve model names")
     parser.add_argument("--env",          type=str,   help="Environment variables KEY=VALUE (repeatable)")
     parser.add_argument("--args",       type=str,   help="Extra args for engine")
     parser.add_argument("--validation", action="store_true")
@@ -674,6 +688,7 @@ SHARED OPTIONS  (identical to bench.py — see docs/bench_config.md)
 
   --output OUTPUT_PATH     Directory for benchmark logs and results.
   --datapath PATH          Absolute path to dataset directory.
+  --model-search-paths     Comma-separated model search roots used to resolve model names.
   --modeling-dir PATH      Path to xgboost model directory.
                            Default: <repo_root>/modeling
 
@@ -709,6 +724,7 @@ CONFIG FILE EXAMPLE
       "batch":   "32",
       "rate":    ["1", "2", "4", "inf"],
       "input":   "sharegpt@0_0",
+      "model_search_paths": ["~/models"],
       "platforms": [{{"gpu": "H200", "version": "0.6.6.post1"}}],
       "ross_extra": [{{"backend": "sglang", "mem_fraction_static": [0.9], "chunked_prefill_size": [8192]}}]
   }}

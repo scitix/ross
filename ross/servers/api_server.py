@@ -62,7 +62,7 @@ def _resolve_tokenization(rid: int, text: str) -> int:
 def call_bench_serving(model, framework, dataset_name, dataset, isl, osl, rate, num_prompt, req_output, batch_size):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     ross_dir = os.path.dirname(script_dir)  # ross/ (parent of servers/)
-    log_dir = os.path.join(script_dir, "log")
+    log_dir = os.path.join(ross_dir, "log")
     os.makedirs(log_dir, exist_ok=True)
     subprocess.run(
         [os.path.join(ross_dir, "ross_launch_server.sh"), model, framework,

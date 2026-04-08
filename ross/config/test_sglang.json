@@ -1,7 +1,7 @@
 {
     "backend": ["sglang"],
     "platforms": [{"gpu": "H200", "version": "0.5.6"}],
-    "model": ["Meta-Llama-3.1-70B"],
+    "model": ["Qwen2.5-72B-Instruct"],
     "mode": "online",
     "parallel": ["1:1:8", "1:1:4@1:1:4"],
     "batch": [256],
@@ -9,6 +9,7 @@
     "inputs": ["sharegpt@500_2500"],
     "output": "~/.etc",
     "datapath": "~/.etc",
+    "model_search_paths": "/models",
     "ross_extra": [
         {
             "backend": "sglang",

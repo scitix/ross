@@ -245,12 +245,12 @@ def list_pip_versions(package):
 
     return latest, versions, msg
 
-def get_model(model: str) -> str:
+def get_model(model: str, search_roots=None) -> str:
     """
     Resolve a model name to an absolute model path.
     
     - If `model` is already a path: resolve & validate.
-    - Otherwise search common model locations.
+    - Otherwise search configured model locations.
     """
     p = Path(model).expanduser().resolve()
     if p.exists():
@@ -259,16 +259,7 @@ def get_model(model: str) -> str:
             p = p / "v1.0"
         return str(p)
 
-    homepath = str(Path("~").expanduser())
-    model_home = [
-        "/root/models",
-        "/models/preset",
-        "/scratch/AIInfra/LLM/hf_models",
-        f"{homepath}/models",
-        "/volume/hisys/models",
-        "/volume/ycao03/models",
-    ]
-
+    model_home = search_roots or []
     model_path = None
     for base in model_home:
         base_dir = Path(base).expanduser().resolve()

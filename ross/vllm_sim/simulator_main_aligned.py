@@ -237,7 +237,6 @@ def run_simulation_disagg_aligned(
     request_source: VirtualClientStore,
     prefill_ross_models: Dict[str, Any],
     decode_ross_models: Dict[str, Any],
-    decode_pp_pre_model: ROSSModel,
     scheduler_kwargs: Dict[str, Any],
     isl: int,
     osl: int,
@@ -442,14 +441,6 @@ def run_sim(args):
     decode_memory_increase = load_memory_increase(args.mem_profiling_path, {"pp": 1, "tp": args.decode_tp_size})
     prefill_model, prefill_ross_models = _init_worker_config("prefill_")
     decode_model, decode_ross_models = _init_worker_config("decode_")
-    decode_pp_pre_model = ROSSModel(
-        saved_model_path=args.pp_pre_forward_path,
-        platform_perf=platform_perf,
-        model=decode_model,
-        inference_config=decode_model.inference_config,
-        regressor="xgboost",
-    )
-
     ret = run_simulation_disagg_aligned(
         prefill_model=prefill_model,
         decode_model=decode_model,
@@ -457,7 +448,6 @@ def run_sim(args):
         request_source=request_store,
         prefill_ross_models=prefill_ross_models,
         decode_ross_models=decode_ross_models,
-        decode_pp_pre_model=decode_pp_pre_model,
         scheduler_kwargs=scheduler_kwargs,
         isl=args.max_prompt_len,
         osl=args.max_output_len,
