@@ -444,6 +444,8 @@ def run_simulation_disagg_aligned(
                 f"[PQDrift] worker={worker.dp_rank}, pq_wall_time={wall_time:.5f}, "
                 f"worker_wall_time={worker.wall_time:.5f}"
             )
+        # if worker.step > 10000:
+        #     raise RuntimeError(f"Worker exceeded step limit: dp_rank={worker.dp_rank}, step={worker.step}, wall_time={worker.wall_time:.5f}")
         logger.debug(f"Worker Rank: {worker.dp_rank}, Step: {worker.step}, Wall Time: {wall_time}")
         if worker.dp_rank.find("prefill") != -1: # Prefill
             worker.fetch_new_request(decode_workers)

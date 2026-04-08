@@ -478,6 +478,15 @@ class Scheduler:
                 if batch.prefill_targets.get(req.request_id, req.chunk_offset) >= req.prompt_tokens
         ]
         if self.disaggregation_mode == "prefill":
+            for req in completed_prefill:
+                # In disaggregated mode, decode owns its own KV reservation. Once a
+                # request finishes prefill on the prefill worker, release the prefill
+                # worker's KV while keeping req.chunk_offset as the completed prompt
+                # progress for decode admission.
+                self.kv_allocator.free(req.request_id)
+                released = min(req.chunk_offset, self.total_prefill_tokens)
+                if released > 0:
+                    self.total_prefill_tokens -= released
             self.completed_prefill_reqs.extend(completed_prefill)
             return
         if not completed_prefill:

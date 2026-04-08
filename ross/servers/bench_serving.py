@@ -1630,6 +1630,8 @@ def sample_repoqa_requests(
         raise ValueError("output_len too small")
     if not dataset_path:
         raise ValueError("RepoQA requires --dataset-path")
+    max_prompt_len = 0 if max_prompt_len is None else max_prompt_len
+    max_output_len = 0 if max_output_len is None else max_output_len
 
     if dataset_path.endswith(".jsonl"):
         with open(dataset_path, encoding="utf-8") as f:
@@ -1710,6 +1712,8 @@ def sample_aime_requests(
 ) -> List[DatasetRow]:
     if fixed_output_len is not None and fixed_output_len < 1:
         raise ValueError("output_len too small")
+    max_prompt_len = 0 if max_prompt_len is None else max_prompt_len
+    max_output_len = 0 if max_output_len is None else max_output_len
 
     from datasets import load_dataset
 
@@ -2470,12 +2474,9 @@ if __name__ == "__main__":
         default="sharegpt",
         choices=[
             "sharegpt",
+            "repoqa",
+            "aime",
             "random",
-            "random-ids",
-            "generated-shared-prefix",
-            "mmmu",
-            "random-image",
-            "mooncake",
         ],
         help="Name of the dataset to benchmark on.",
     )
