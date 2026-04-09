@@ -1,0 +1,23 @@
+{
+    "backend": ["sglang"],
+    "platforms": [{"gpu": "H200", "version": "0.5.6"}],
+    "model": ["Qwen3-32B"],
+    "mode": "online",
+    "parallel": ["1:1:4@1:1:4"],
+    "batch": [128],
+    "num_prompt": 512,
+    "inputs": ["repoqa@11736_373"],
+    "output": "~/.etc",
+    "datapath": "~/.etc",
+    "model_search_paths": "/volume/hisys/ycao/models/preset_models",
+    "ross_extra": [
+        {
+            "backend": "sglang",
+            "num_gpus": 8,
+            "mem_fraction_static": [0.9]
+        }
+    ],
+    "override":   false,
+    "quiet":      false,
+    "validation": false
+}

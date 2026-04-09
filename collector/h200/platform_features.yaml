@@ -1,0 +1,13 @@
+measured:
+  platform_attention_flops_per_ms: 8384.024686298768
+  platform_gemm_flops_per_ms: 793.6223699634077
+  platform_memory_bandwidth_gbps: 5792.262828065905
+  platform_nccl_avg_latency_ms: 0.2572607638888889
+  platform_nccl_max_bandwidth_gbps: 708.3664136645148
+theoretical:
+  fp16_tflops: 989.0
+  fp8_tflops: 1978.0
+  int8_tflops: 1978.0
+  memory_bandwidth_gbps: 4800.0
+  memory_gb: 141
+  power_w: 700
