@@ -1,4 +1,3 @@
-
 import json
 import pandas as pd
 import numpy as np
@@ -139,8 +138,8 @@ def print_analysis_summary(df: pd.DataFrame, results: Dict, data_source_info: st
     print(f"  R-squared: {results['r2']:.4f}")
     print(f"  RMSE: {results['rmse']:.2f} ms")
     print(f"  MAE: {results['mae']:.2f} ms")
-    print(f"  MAPE: {results['mape']:.2f}%  ← 平均误差百分比")
-    print(f"  Median APE: {results['median_ape']:.2f}%  ← 中位数误差百分比")
+    print(f"  MAPE: {results['mape']:.2f}%  <- mean absolute percentage error")
+    print(f"  Median APE: {results['median_ape']:.2f}%  <- median absolute percentage error")
     if 'val_metrics' in results and results['val_metrics'] is not None:
         vm = results['val_metrics']
         print(f"  Validation R-squared: {vm['r2']:.4f}")
@@ -158,4 +157,4 @@ def print_analysis_summary(df: pd.DataFrame, results: Dict, data_source_info: st
         print(f"  Feature scaling: Applied (cross-model analysis)")
     else:
         print(f"  Feature scaling: Not needed (similar scale features)")
-    
+
