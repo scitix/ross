@@ -1,14 +1,22 @@
 # ROSS
 
-ROSS is an offline simulator for LLM inference performance. Given a model, a
-hardware platform, and a workload description, it predicts throughput and
-latency metrics (TTFT, TPOT, ITL) without running a real inference server.
-It supports both SGLang and vLLM backends, colocated and disaggregated
-parallelism, and Pareto-front search over parallel configurations.
+ROSS is an offline simulator for LLM inference performance. Given a model, a hardware platform, and a workload description, it predicts throughput and latency metrics (TTFT, TPOT, ITL) without running a real inference server. It supports both SGLang and vLLM backends, colocated and disaggregated parallelism, and Pareto-front search over parallel configurations.
 
 ---
 
-## Repository layout
+## Table of Contents
+
+1. [Getting Started](#getting-started)
+2. [Basic Usage](#basic-usage)
+3. [Advanced Features](#advanced-features)
+4. [Supported Models](#supported-models)
+5. [Citation](#citation)
+
+---
+
+## Getting Started
+
+### Repository layout
 
 ```
 collector/          Platform profiling scripts + pre-collected hardware profiles
@@ -19,100 +27,226 @@ ross/               Main simulator package
   pareto/             Pareto-front analysis utilities
   config/             Example JSON config files
   ross_predict.py     Entry point for offline prediction sweeps
-docs/               Extended documentation
-  bench_config.md     Full config file and CLI reference
-  profiling.md        How to profile a new GPU platform
 modeling/           Pre-trained XGBoost regression models
 test/               Unit and integration tests
 ```
 
----
+### Installation
 
-## Quick start
-
-### 1. Install dependencies
+ROSS runs on a CPU-only host; no GPU is required for simulation.
 
 ```bash
 pip install xgboost==3.2.0 scikit-learn pandas tqdm plotext
 ```
 
-### 2. Write a config file
+Pre-trained regression models for H200 and B200 are loaded at runtime from the directory specified by the `modeling_dir` field in your config file (or via the `--modeling-dir` CLI flag). If you want to target a new GPU, follow the profiling workflow described in the [Advanced Features](#advanced-features) section and point `modeling_dir` at the resulting model directory.
 
-Use one of the templates in `ross/config/` as a starting point:
+### A first prediction
+
+Create a minimal JSON config:
 
 ```json
 {
-    "backend":  "sglang",
-    "model":    "Meta-Llama-3.1-70B",
-    "parallel": "1:1:8",
-    "batch":    [64],
+    "backend":   "sglang",
+    "model":     "Meta-Llama-3.1-70B",
+    "parallel":  "1:1:8",
+    "batch":     [64],
     "num_prompt": 512,
-    "rate":     ["1", "2", "inf"],
-    "inputs":   ["sharegpt@0_0"],
+    "rate":      ["1", "2", "inf"],
+    "inputs":    ["sharegpt@0_0"],
     "platforms": [{"gpu": "H200", "version": "0.6.6"}],
-    "output":   "~/.etc",
-    "datapath": "~/.etc"
+    "output":    "~/.etc",
+    "datapath":  "~/.etc",
+    "model_search_paths": "/path/to/models",
+    "modeling_dir":       "/path/to/modeling"
 }
 ```
 
-### 3. Run the simulator
+Run the simulator:
 
 ```bash
-cd <repo_root>
-python ross/ross_predict.py --config <your_config.json>
+python ross/ross_predict.py --config my_config.json
 ```
 
-Add `--eval` to also load real execution traces and compute prediction error:
+Output includes per-request and aggregate latency/throughput metrics. Add `--record-path results.csv` to also persist a CSV log.
 
-```bash
-python ross/ross_predict.py --config <your_config.json> --eval
+---
+
+## Basic Usage
+
+### The `ross_predict.py` entry point
+
+`ross_predict.py` is the single entry point for all offline prediction sweeps. Configuration is read from a JSON file and may be overridden per-flag on the command line. Priority order (later wins):
+
+```
+built-in default  <  --config FILE  <  command-line flags
 ```
 
-Add `--get-pareto-front` to search all valid parallel configs and plot the
-Pareto frontier (tokens/s/user vs tokens/s/gpu):
+### Common CLI flags
 
-```bash
-python ross/ross_predict.py --config <your_config.json> --get-pareto-front
+| Flag                      | Description                                          |
+| ------------------------- | ---------------------------------------------------- |
+| `--config FILE`           | JSON config file (recommended for sweeps)            |
+| `--backend sglang\|vllm`  | Simulator backend                                    |
+| `--model`                 | Model name or absolute path                          |
+| `--parallel`              | Parallelism spec, e.g. `1:1:8` or `1:1:4@1:1:4`      |
+| `--batch`                 | Max batch size per GPU                               |
+| `--rate`                  | Comma-separated request rates (`inf` for max tput)   |
+| `--input`                 | Dataset + sequence-length spec                       |
+| `--modeling-dir`          | Path to XGBoost model directory                      |
+| `--model-search-paths`    | Comma-separated model search roots                   |
+| `--record-path FILE`      | Write metrics to CSV                                 |
+| `--eval`                  | Load trace logs and compute prediction error         |
+| `--get-pareto-front`      | Enumerate configs and compute Pareto front           |
+| `--debug`                 | Verbose logging                                      |
+
+A complete list of CLI flags, JSON config fields, and engine-specific arguments is documented in [`docs/bench_config.md`](docs/bench_config.md).
+
+### Parallelism format
+
+```
+# Prefill-decode colocate
+dp:pp:tp                       e.g. 1:1:8   (1 DP × 1 PP × 8 TP = 8 GPUs)
+
+# Prefill-decode disaggregation
+dp:pp:tp@dp:pp:tp              e.g. 1:1:4@1:1:4 (4 prefill + 4 decode GPUs)
+
+# Multiple configurations (comma-separated)
+1:1:8,1:1:4,1:1:4@1:1:4
 ```
 
-### 4. Save results
+### Input (workload) format
+
+```
+dataset[@isl_osl]
+
+dataset  ∈ sharegpt | repoqa | aime
+isl, osl = integer (exact length; 0 = use the dataset's natural length, no cap)
+
+Examples:
+  sharegpt                 # dataset defaults (ISL≈500, OSL≈100)
+  sharegpt@0_0             # use each sample's natural ISL and OSL, no cap
+  sharegpt@0_100           # natural ISL, OSL forced to 100
+  repoqa@4096_1024         # ISL=4096, OSL=1024
+  aime@512_8192            # ISL=512, OSL=8192
+```
+
+Setting `isl` or `osl` to `0` tells the dataset loader to keep the original sequence length from the source dataset instead of truncating or padding to a fixed value. This is the recommended setting when you want the simulator to see the workload's real length distribution (e.g. `sharegpt@0_0`).
+
+### Validating against a real trace
+
+When real benchmark traces are available, add `--eval` to compute per-configuration percentage error (PE) for E2E latency, TTFT, TPOT, and ITL against the recorded ground truth:
 
 ```bash
-python ross/ross_predict.py --config <your_config.json> --record-path results.csv
+python ross/ross_predict.py --config my_config.json --eval
 ```
 
 ---
 
-## Key CLI flags
+## Advanced Features
 
-| Flag                      | Description                                  |
-| ------------------------- | -------------------------------------------- |
-| `--config FILE`         | JSON config file (recommended for sweeps)    |
-| `--backend sglang\|vllm` | Simulator backend                            |
-| `--eval`                | Load trace logs and compute prediction error |
-| `--record-path FILE`    | Write metrics to a CSV file                  |
-| `--get-pareto-front`    | Enumerate configs and compute Pareto front   |
-| `--debug`               | Verbose logging                              |
+### Pareto-front search over parallelism
 
-Full reference: [`docs/bench_config.md`](docs/bench_config.md)
+Pass `--get-pareto-front` to enumerate all valid parallel configurations (colocated and PD-disaggregated) for a given model and hardware budget and plot the Pareto frontier of *tokens/s/user* vs *tokens/s/GPU*:
+
+```bash
+python ross/ross_predict.py --config my_config.json --get-pareto-front
+```
+
+A 228-candidate sweep for a 32B model on an 8-GPU B200 cluster completes in about 70 minutes on a CPU-only server — roughly **1,258× cheaper** than exhaustive on-hardware evaluation. `--get-pareto-front` is mutually exclusive with `--eval`.
+
+### Prefill–decode disaggregation
+
+Disaggregated deployments are expressed by splitting the parallelism spec with an `@`:
+
+```bash
+python ross/ross_predict.py \
+    --config base.json \
+    --parallel "1:1:4@1:1:4"
+```
+
+ROSS models the KV-cache transfer between the prefill and decode workers as part of the virtual-clock critical path.
+
+### Multi-dimensional sweeps
+
+Any sweep dimension — backend, model, parallelism, batch size, request rate, dataset, platform, engine argument — can be a list. ROSS iterates the Cartesian product and writes one row per cell to the CSV record:
+
+```json
+{
+    "backend":  ["vllm", "sglang"],
+    "model":    ["Qwen2.5-72B-Instruct", "Llama-3.1-70B"],
+    "parallel": ["1:1:8", "1:1:4@1:1:4"],
+    "batch":    [32, 64],
+    "rate":     ["1", "2", "4", "inf"],
+    "inputs":   ["sharegpt@500_100", "repoqa@4096_1024"],
+    "platforms": [
+        {"gpu": "H200", "version": "0.6.6.post1"},
+        {"gpu": "B200", "version": "0.7.0"}
+    ],
+    "model_search_paths": "/path/to/models",
+    "modeling_dir":       "/path/to/modeling"
+}
+```
+
+### Engine-specific arguments
+
+Forward framework-specific knobs through `ross_extra` (config file) or `--args` (CLI). Each entry may contain lists to trigger an inner sweep.
+
+```json
+"ross_extra": [
+    {
+        "backend":              "sglang",
+        "mem_fraction_static":  [0.85, 0.9],
+        "chunked_prefill_size": [8192, 16384]
+    },
+    {
+        "backend":                "vllm",
+        "gpu_memory_utilization": [0.9],
+        "max_num_batched_tokens": [8192, 16384]
+    }
+]
+```
+
+CLI equivalent:
+
+```bash
+--args "sglang@mem_fraction_static=0.9,chunked_prefill_size=8192"
+```
+
+### Parallel workers
+
+Large sweeps are parallelized across CPUs via `--max-workers` and `--threads-per-worker`. Both default to auto-selection based on the host's CPU count and scale linearly with available cores.
+
+### Profiling a new GPU platform
+
+ROSS's data plane is trained from sparse per-platform profiles collected under `collector/`. To target a new GPU, run the provided profiling scripts on that platform (~3–4 wall-clock hours on an 8-GPU node) and retrain the stage-wise regressor. The resulting XGBoost model is then pointed to via `modeling_dir` in your config. The control plane requires no changes because it is reused from the native serving framework.
+
+Step-by-step instructions for profiling a new platform are in [`docs/profiling.md`](docs/profiling.md).
+
+### Stage-level discrepancy analysis
+
+Because ROSS decomposes each iteration into pre/forward/post stages, comparing simulated and measured stage times isolates where a real system deviates from its predictable behavior. This was used to localize a batch-boundary bottleneck in SGLang's TokenizerManager, whose structural fix reduced end-to-end latency by 36% at high concurrency.
 
 ---
 
-## Adding a new GPU platform
+## Supported Models
 
-See [`docs/profiling.md`](docs/profiling.md) for the step-by-step guide on
-collecting kernel and communication performance data for a new hardware target.
+ROSS's stage-wise regressor takes **model configuration features** as input rather than per-model kernel calibration, so new models within a supported family typically work out of the box. Validated models include:
 
-Pre-collected profiles for H200 and B200 are already included under
-`collector/`.
+| Family      | Variants                                      |
+| ----------- | --------------------------------------------- |
+| Llama-3.1   | 8B, 70B                                       |
+| Qwen2.5     | 72B-Instruct                                  |
+| Qwen3       | 32B, 30B-A3B (MoE), 235B-A22B (MoE), QwQ 32B  |
+| DeepSeek-V3 | 671B (MoE)                                    |
+| gpt-oss     | 20b, 120b                                     |
 
----
+**Backends:** vLLM, SGLang
+**Deployment modes:** colocated, PD-disaggregated
+**Hardware:** NVIDIA H200, B200 (extensible via the `collector/` workflow)
+**Datasets:** ShareGPT, RepoQA, AIME
 
-## Supported configurations
+Models and platforms outside this list can generally be added by:
 
-| Dimension   | Options                                                                         |
-| ----------- | ------------------------------------------------------------------------------- |
-| Backend     | SGLang, vLLM                                                                    |
-| Parallelism | Tensor parallel, pipeline parallel, data parallel, disaggregated prefill/decode |
-| Hardware    | H200, B200 (extensible via `collector/`)                                      |
-| Datasets    | ShareGPT, RepoQA, AIME                                                          |
+1. Placing the HF-format model under your configured `model_search_paths`, and
+2. Profiling the target GPU with the `collector/` scripts if it is not H200/B200.

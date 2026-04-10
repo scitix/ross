@@ -51,14 +51,11 @@ These are accepted by `ross_predict.py`.
 | `--batch BATCH_SIZES`  | str  | `64`                   | Comma-separated max-batch-size values (per GPU).                                                                  |
 | `--rate RATES`         | str  | `inf`                  | Comma-separated request rates (req/s). Use `inf` for max-throughput / offline mode.                             |
 | `--input INPUT_SPEC`   | str  | `sharegpt@0_0`         | Dataset + sequence-length spec. See[Input format](#input-format).                                                    |
-| `--output OUTPUT_PATH` | str  | `~/.etc`               | Directory for benchmark logs and result files. Must exist.                                                        |
+| `--output OUTPUT_PATH` | str  | `~/.etc`               | Root directory under which `--eval` looks up real execution traces. Not read in pure forward-prediction mode.     |
 | `--datapath PATH`      | str  | `~/.etc`               | Absolute path to the dataset directory. Must exist.                                                               |
-| `--env KEY=VALUE`      | str  | _(none)_               | Comma-separated extra environment variables (e.g.`OMP_NUM_THREADS=8,NUMEXPR_MAX_THREADS=16`).                   |
 | `--args STRING`        | str  | _(none)_               | Engine-specific arguments. See[Engine-specific extra args](#engine-specific-extra-args).                             |
-| `--override`           | flag | `false`                | Skip configurations whose output directory already exists.                                                        |
-| `--quiet`              | flag | `false`                | Suppress non-critical output.                                                                                     |
-| `--validation`         | flag | `false`                | Validate correctness of model outputs.                                                                            |
-| `--modeling-dir PATH`  | str  | _(auto)_               | Path to directory containing xgboost models. Auto-detected when omitted.                                          |
+| `--modeling-dir PATH`  | str  | `<repo_root>/modeling` | Path to directory containing xgboost regression models.                                                           |
+| `--model-search-paths` | str  | _(none)_               | Comma-separated model search roots used to resolve model names into absolute paths.                              |
 | `-h` / `--help`      | flag | —                       | Print help and exit.                                                                                              |
 
 #### Parallelism format
@@ -80,13 +77,12 @@ dp:pp:tp@dp:pp:tp         e.g.  1:1:4@1:1:4   (4 prefill GPUs + 4 decode GPUs)
 dataset[@isl_osl]
 
 dataset   ∈ sharegpt | repoqa | aime
-isl, osl  = integer (exact length)  OR  X:Y (uniform range [X, Y])
+isl, osl  = integer (exact length)
 
 Examples:
   sharegpt                  # use dataset defaults (ISL≈500, OSL≈100)
   repoqa@4096_1024          # ISL=4096, OSL=1024
   aime@512_8192             # ISL=512, OSL=8192
-  sharegpt@64:256_100       # ISL∈[64,256], OSL=100
 ```
 
 ---
@@ -121,21 +117,17 @@ override the file.
 | `model`               | string or list                               | `"Qwen2.5-72B-Instruct"`                                | Same as `--model`.                                                                                                                                                                                       |
 | `mode`                | string                                       | `"online"`                                              | `"online"` or `"offline"`.                                                                                                                                                                             |
 | `parallel`            | string or list                               | `"1:1:8"`                                               | Same as `--parallel`. E.g. `"1:1:8,1:1:4"` or `["1:1:8", "1:1:4"]`.                                                                                                                                  |
-| `batch`               | string or list                               | `"32"`                                                  | Same as `--batch`. E.g. `"32,64"` or `[32, 64]`.                                                                                                                                                     |
+| `batch`               | string or list                               | `"64"`                                                  | Same as `--batch`. E.g. `"32,64"` or `[32, 64]`.                                                                                                                                                     |
 | `rate`                | list                                         | `["inf"]`                                               | Request rates as a list of strings. E.g.`["1", "2", "4", "inf"]`.                                                                                                                                        |
-| `input`               | string                                       | `"sharegpt@500_100"`                                    | Same as `--input`. Only the first `input` entry is used for validation.                                                                                                                                |
+| `input`               | string                                       | `"sharegpt@0_0"`                                    | Same as `--input`. Only the first `input` entry is used for validation.                                                                                                                                |
 | `inputs`              | list of strings                              | `[]`                                                    | Additional input specs (same format as `input`). The first element also sets `input`. Allows sweeping multiple datasets / ISL-OSL pairs.                                                               |
 | `output`              | string                                       | `"~/.etc"`                                              | Same as `--output`.                                                                                                                                                                                      |
 | `datapath`            | string                                       | `"~/.etc"`                                              | Same as `--datapath`.                                                                                                                                                                                    |
-| `worker`              | string or list                               | _(auto)_                                                | Same as `--worker`.                                                                                                                                                                                      |
+| `modeling_dir`        | string                                       | `<repo_root>/modeling`                                  | Same as `--modeling-dir`. Path to directory containing xgboost regression models.                                                                                                                        |
+| `model_search_paths`  | string or list                               | _(built-in)_                                            | Same as `--model-search-paths`. Roots used to resolve model names into absolute paths.                                                                                                                    |
 | `num_prompt`          | int                                          | `512`                                                   | Number of prompts per benchmark run.                                                                                                                                                                       |
 | `disaggregation_mode` | string                                       | `"colocation"`                                          | Disaggregation scheduling mode. Currently informational.                                                                                                                                                   |
-| `env`                 | dict                                         | `{"OMP_NUM_THREADS": "8", "NUMEXPR_MAX_THREADS": "32"}` | Environment variables to set before launching inference processes. Values from the file are*merged* with the defaults.                                                                                   |
 | `ross_extra`          | list of dicts                                | `[]`                                                    | Engine-specific arguments in list form. Each dict must have a `"backend"` key. See [Engine-specific extra args](#engine-specific-extra-args).                                                               |
-| `override`            | bool                                         | `false`                                                 | Same as `--override`.                                                                                                                                                                                    |
-| `quiet`               | bool                                         | `false`                                                 | Same as `--quiet`.                                                                                                                                                                                       |
-| `validation`          | bool                                         | `false`                                                 | Same as `--validation`.                                                                                                                                                                                  |
-| `verbose`             | bool                                         | `false`                                                 | Same as `--verbose`.                                                                                                                                                                                     |
 
 > **Note on `platforms`:** when this field is present, version strings and
 > GPU names are taken from the list rather than auto-detected at runtime. This
@@ -157,18 +149,18 @@ override the file.
     "parallel": "1:1:8",
     // "parallel": ["1:1:8", "1:1:4@1:1:4"],
 
-    "batch":    "32",
+    "batch":    [32],
 
     // Rates as a list (preferred) or comma-string
     "rate":     ["1", "2", "4", "8", "inf"],
 
     // ── Dataset ──────────────────────────────────────────────────────────
     // Single dataset
-    "input":  "sharegpt@500_100",
+    "input":  "sharegpt@0_0",
 
     // OR multiple datasets via "inputs" (first also sets "input")
     // "inputs": [
-    //     "sharegpt@500_100",
+    //     "sharegpt@0_0",
     //     "random@128_128",
     //     "random@1024_512"
     // ],
@@ -187,12 +179,6 @@ override the file.
     // ── Prompt count ──────────────────────────────────────────────────────
     "num_prompt": 512,
 
-    // ── Environment variables ─────────────────────────────────────────────
-    "env": {
-        "OMP_NUM_THREADS":    "8",
-        "NUMEXPR_MAX_THREADS": "32"
-    },
-
     // ── Engine-specific arguments ─────────────────────────────────────────
     // List form (used in config files). Each entry must have "backend".
     // Values that are lists cause an inner sweep over those values.
@@ -208,12 +194,7 @@ override the file.
         //     "gpu_memory_utilization":   [0.9],
         //     "max_num_batched_tokens":   [8192, 16384]
         // }
-    ],
-
-    // ── Misc flags ────────────────────────────────────────────────────────
-    "override":   false,
-    "quiet":      false,
-    "validation": false
+    ]
 }
 ```
 
@@ -308,7 +289,7 @@ python ross_predict.py \
     "backend":  "vllm",
     "model":    "/models/Qwen2.5-72B-Instruct",
     "parallel": "1:1:8",
-    "batch":    "32",
+    "batch":    [32],
     "rate":     ["1", "2", "4", "inf"],
     "input":    "sharegpt@500_100",
     "platforms": [{"gpu": "H200", "version": "0.7.0"}],

@@ -7,7 +7,6 @@ import re
 import sys
 import json
 from pathlib import Path
-import subprocess
 
 
 ###############################################################################
@@ -42,108 +41,6 @@ DEFAULT_RESERVE  = 0.9
 DEFAULT_CHUNK_PREFILL_SIZE = 8192
 DEFAULT_MODEL_SEARCH_PATHS = ["~/models"]
 
-def show_help():
-    help_text = f"""
-usage: ross_predict.py [options]
-
-optional arguments:
-  --backend BACKENDS       Comma-separated list of backends ({"/".join(avail_backends)}) to benchmark.
-  --model MODELS           Comma-separated list of models (name or full path) (default: {DEFAULT_MODELS}).
-  --mode MODE              Benchmark mode: "online" or "offline" (default: {DEFAULT_MODE}).
-  
-  --parallel PARALLEL      Comma-separated list of parallelism configuration (default: {DEFAULT_PARALLEL}). 
-                               Format: conf1,conf2,conf3,...
-                               Each conf can be
-                               dp:pp:tp           Prefill-decode colocate mode.
-                               dp:pp:tp@dp:pp:tp  Prefill-decode disaggregation mode (prefill parallelism, decode parallelism]
-  --batch BATCH_SIZES      Comma-separated list of batch sizes (default: {DEFAULT_BATCH}).
-  --rate RATE              Comma-separated list of request rates (default: {DEFAULT_RATE}).
-
-  --input INPUT_SPEC       Input dataset type. Format: dataset[@isl_osl], e.g., random@128_128, sharegpt@64:128_100.
-                               Where:
-                                  - dataset ∈ '{'{avail_dataset}'}'
-                                  - isl and osl ([@isl_osl] is optional) can be 
-                                    * a single integer (e.g., 128)
-                                    * a range in the form X:Y (e.g., 64:256)
-                               Default: {DEFAULT_INPUT}
-  --output OUTPUT_PATH     Path for benchmark logs and result outputs (default: ~/.etc).
-  --datapath PATH          Absolute path to dataset directory (default: ~/.etc).
-  --model-search-paths     Comma-separated roots used to resolve model names when --model is not an absolute path.
-
-  --worker WORKER_NAME     Comma-separated list of worker hostname for multi-machine benchmarks.
-                           Not recommended to set manually. The runtime system will automatically select the appropriate machine
-                           based on ~/.etc/cluster_info: if the requested number of GPUs does not exceed the local machine’s capacity,
-                           the local host will be used; otherwise, the system will query ~/.etc/cluster_info for machines with the
-                           same GPU type and automatically choose one that satisfies the requirements.
-
-  --env KEY=VALUE          Declare environment variables (repeatable).
-                           Examples:
-                               OMP_NUM_THREADS=8,NUMEXPR_MAX_THREADS=16
-  --args STRING            Extra arguments passed directly to the inference engine. 
-                           Format: backend1@key=val,key=val,...;backend2@@key=val,key=val,...
-                        
-                           Notes:
-                               - The backend name appears before the '@'.
-                               - The same backend can appear multiple times, allowing you to test multiple argument sets for the same backend.
-                               - Arguments after '@' are comma-separated.
-                               - Each argument can be:
-                                   key=value                                     For offline
-                                   --flag=value or --flag (boolean flags)        For online
-                           Examples:
-                               --args "vllm@reserve=0.9,eager=True"
-                               --args 'vllm@--reserve=0.9,--eager'
-                               --args "vllm@reserve=0.9,eager=True;vllm@reserve=0.5,eager=False"
-
-  --validation             Validate correctness of outputs.
-  --override               Skip runs that already exist in output dir.
-  --quiet                  Suppress non-critical output.
-
-  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-  --config FILE            Path to configuration file. 
-                           *** Priority: default value < config file < command line args. ***
-                           For repeated or large-scale test runs, it is recommended to put frequently used arguments 
-                           into the config file instead of typing long command lines every time. This allows running:
-                               python ross_predict.py --config FILE
-                           to reproduce or simplify benchmark executions.
-  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-  
-  -h, --help               Show this help message and exit.
-"""
-    print(help_text)
-
-import json
-
-def generate_config_template(path="config_template.json"):
-    """
-    Generate a JSON config template containing all available arguments.
-    """
-    template = {
-        "backend":       "vllm,sglang",
-        "model":         DEFAULT_MODELS,
-        "mode":          DEFAULT_MODE,
-        "parallel":      DEFAULT_PARALLEL,
-        "batch":         DEFAULT_BATCH,
-        "input":         DEFAULT_INPUT,
-        "output":        str(Path(etcpath).expanduser().resolve()),
-        "datapath":      str(Path(etcpath).expanduser().resolve()),
-        "model_search_paths": DEFAULT_MODEL_SEARCH_PATHS,
-        "worker":        "",
-
-        # special fields
-        "env":           {"OMP_NUM_THREADS": "2"},
-        "args":          "",
-        "override":      False,
-        "quiet":         False,
-        "validation":    False,
-        "verbose":       False,
-    }
-
-    with open(path, "w") as f:
-        json.dump(template, f, indent=4)
-
-    print(f"Config template written to {path}")
-
-
 class BenchmarkConfig:
     """
     Configuration object built from parsed command-line arguments.
@@ -158,19 +55,13 @@ class BenchmarkConfig:
             self.gpuname, _   = util.cuda_info()
         except:
             self.gpuname  = DEFAULT_GPU
-        self.hostname     = util.get_local_hostname()
-        self.address      = util.get_local_ip()
-        self.username     = "root"
         self.num_prompt   = 512
-        self.port_ssh     = util.port_ssh
-        self.port_ray     = 55556
 
         self.args = {b: [] for b in avail_backends}
         import torch
         num_gpu = torch.cuda.device_count()
         self.num_gpu      = num_gpu
 
-        self.raw          = args
         self.backends     = self._split(args.backend)
         self.platforms    = None
         self.model_specs  = self._split(args.model)
@@ -189,12 +80,8 @@ class BenchmarkConfig:
         self.output       = args.output
         self.datapath     = args.datapath
         self.model_search_paths = self._as_list(args.model_search_paths) if getattr(args, "model_search_paths", None) else []
-        self.override     = args.override
-        self.quiet        = args.quiet
-        self.validation   = args.validation
         self.config       = str(Path(args.config).expanduser().resolve()) if args.config else None
         self.modeling_dir = args.modeling_dir if hasattr(args, "modeling_dir") else None
-        self.envs.update(self._split_dict(args.env))
         self._parse_args(args.args)
 
         self.apply_conf()
@@ -205,9 +92,7 @@ class BenchmarkConfig:
         self.check()
 
     def pre_init(self):
-        self.envs, self.args = {}, {}
-        self.envs["OMP_NUM_THREADS"] = 8
-        self.envs["NUMEXPR_MAX_THREADS"] = 32
+        self.args = {}
 
     def post_init(self):
         self.backend_info = {b: {} for b in self.backends}
@@ -339,16 +224,8 @@ class BenchmarkConfig:
                     str(Path(p).expanduser().resolve()) for p in self._as_list(conf["model_search_paths"])
                 ]
 
-            if "env" in conf.keys():
-                self.envs.update(conf["env"])
             if "ross_extra" in conf.keys():
                 self._parse_args(conf["ross_extra"])
-            if not self.validation and "validation" in conf.keys():
-                self.validation = conf["validation"]
-            if not self.quiet and "quiet" in conf.keys():
-                self.quiet = conf["quiet"]
-            if not self.override and "override" in conf.keys():
-                self.override = conf["override"]
 
     def check(self):
         if len(self.backends) == 0:
@@ -359,8 +236,6 @@ class BenchmarkConfig:
             util.echo_erro(f"Unrecognized mode: '{self.mode}'")
         if self.input["dataset"] not in avail_dataset:
             util.echo_erro(f"Unrecognized dataset type: {self.input}")
-        if not Path(self.output).is_dir():
-            util.erro(f"{self.output} does not exist!")
         if not Path(self.datapath).is_dir():
             util.erro(f"{self.datapath} does not exist!")
 
@@ -409,20 +284,6 @@ class BenchmarkConfig:
     def _split_int(self, s):
         return [int(x) for x in s.split(",")] if s else []
     
-    def _split_dict(self, s):
-        return {x.split("=")[0]: x.split("=")[1] for x in s.split(",")} if s else {}
-
-    def _parse_env(self, env_list):
-        """Parse repeated --env KEY=VALUE"""
-        if not env_list:
-            return {}
-        env_dict = {}
-        for item in env_list:
-            if "=" not in item:
-                raise ValueError(f"Invalid --env '{item}', expected KEY=VALUE")
-            k, v = item.split("=", 1)
-            env_dict[k.strip()] = v.strip()
-        return env_dict
 
     def _parse_args(self, extra):
         if not extra:
@@ -562,7 +423,7 @@ class BenchmarkConfig:
         #         res = extra_["gpu_memory_utilization"]
         #     if "disable_cuda_graph" in extra_.keys() or "enforce_eager" in extra_.keys():
         #         opt = "eag"
-        self.test_dst      = f"{self.output}/LMDB/{target_gpu}/{self.mode}_{opt}_{res}_{backend_}_{version}/{model_name}_{datatype}_{parallel_}_batch_{batch_}"
+        self.test_dst      = f"{self.output}/{target_gpu}/{self.mode}_{opt}_{res}_{backend_}_{version}/{model_name}_{datatype}_{parallel_}_batch_{batch_}"
         if self.num_prompt != 512:
             self.test_dst = self.test_dst + f"_promptnum_{self.num_prompt}"
         Path(self.test_dst).expanduser().resolve().mkdir(parents=True, exist_ok=True)
@@ -575,14 +436,6 @@ class BenchmarkConfig:
                 if key.find("experts") != -1:
                     is_moe = True
         return self.test_backend, self.test_model, self.test_parallel, self.test_batch, self.test_venv, is_moe
-
-    def get_log(self, suffix=""):
-        file = f"{self.output}/main_{suffix}.log"
-        Path(file).write_text("")
-        return file
-
-    def save_log(self, log):
-        util.echo_back(f"mv {log} {self.test_dst}")
 
     def summary(self):
         """Printable config summary."""
@@ -609,8 +462,6 @@ class BenchmarkConfig:
         for i, key in enumerate(self.args.keys()):
             label = "Scheduler args" if i == 0 else "              "
             s.append(f"       {label} : {key} = {self.args[key]}")
-        s.append(f"       Override     : {self.override}")
-        s.append(f"       Validation   : {self.validation}")
         return "\n".join(s)
 
 def build_parser():
@@ -629,11 +480,7 @@ def build_parser():
     parser.add_argument("--config",       type=str,   help="Path to JSON config file")
     parser.add_argument("--modeling-dir", type=str,   dest="modeling_dir", help=f"Path to modeling directory containing xgboost models (default: {DEFAULT_MODELING_DIR})")
     parser.add_argument("--model-search-paths", type=str, dest="model_search_paths", help="Comma-separated model search roots used to resolve model names")
-    parser.add_argument("--env",          type=str,   help="Environment variables KEY=VALUE (repeatable)")
     parser.add_argument("--args",       type=str,   help="Extra args for engine")
-    parser.add_argument("--validation", action="store_true")
-    parser.add_argument("--override",   action="store_true")
-    parser.add_argument("--quiet",      action="store_true")
     parser.add_argument("-h", "--help", action="store_true")
 
     return parser
@@ -648,17 +495,17 @@ ROSS Simulator — offline prediction script.
 Runs the ROSS simulator over a sweep of configurations and optionally
 compares results against real execution traces.
 
-Select a backend with --backend (sglang or vllm).
+Select a backend with --backend ({" | ".join(avail_backends)}).
 
 ────────────────────────────────────────────────────────────────────────────
-SHARED OPTIONS  (identical to bench.py — see docs/bench_config.md)
+SHARED OPTIONS  (see docs/bench_config.md for full reference)
 ────────────────────────────────────────────────────────────────────────────
 
   --config FILE            Path to JSON configuration file.
                            Priority: default < config file < command-line args.
                            Recommended for large sweeps; keeps command lines short.
 
-  --backend BACKEND        Backend to simulate: sglang | vllm  (REQUIRED)
+  --backend BACKEND        Backend to simulate: {" | ".join(avail_backends)}  (REQUIRED)
 
   --model MODELS           Comma-separated model names or full paths.
                            Default: {DEFAULT_MODELS}
@@ -678,23 +525,24 @@ SHARED OPTIONS  (identical to bench.py — see docs/bench_config.md)
   --input INPUT_SPEC       Dataset and sequence-length spec.
                            Format: dataset[@isl_osl]
                              dataset  ∈ {{{", ".join(avail_dataset)}}}
-                             isl/osl  : integer (e.g. 128) or range X:Y (e.g. 64:256)
+                             isl/osl  : integer (e.g. 128); 0 = use the
+                                        dataset's natural length, no cap
                            Examples:
                              sharegpt               (use built-in ISL/OSL defaults)
+                             sharegpt@0_0           (natural ISL and OSL)
                              repoqa@4096_1024
                              aime@512_8192
-                             sharegpt@64:256_100
                            Default: {DEFAULT_INPUT}
 
-  --output OUTPUT_PATH     Directory for benchmark logs and results.
+  --output OUTPUT_PATH     Root directory under which --eval looks up real
+                           execution traces. Not read in pure forward-
+                           prediction mode.
   --datapath PATH          Absolute path to dataset directory.
   --model-search-paths     Comma-separated model search roots used to resolve model names.
   --modeling-dir PATH      Path to xgboost model directory.
                            Default: <repo_root>/modeling
 
   --mode MODE              online | offline  (default: {DEFAULT_MODE})
-  --worker HOSTNAMES       Comma-separated worker hostnames.
-  --env KEY=VALUE          Extra environment variables.
   --args STRING            Backend scheduler arguments.
                            SGLang: --args "sglang@mem_fraction_static=0.9,chunked_prefill_size=8192"
                            vLLM:   --args "vllm@gpu_memory_utilization=0.9,max_num_batched_tokens=8192"
@@ -721,10 +569,11 @@ CONFIG FILE EXAMPLE
       "backend": "sglang",
       "model":   "Qwen2.5-72B-Instruct",
       "parallel": "1:1:8",
-      "batch":   "32",
+      "batch":   [32],
       "rate":    ["1", "2", "4", "inf"],
       "input":   "sharegpt@0_0",
       "model_search_paths": ["~/models"],
+      "modeling_dir": "~/modeling",
       "platforms": [{{"gpu": "H200", "version": "0.6.6.post1"}}],
       "ross_extra": [{{"backend": "sglang", "mem_fraction_static": [0.9], "chunked_prefill_size": [8192]}}]
   }}
@@ -769,50 +618,3 @@ def parse_predict_args():
         sys.exit(0)
 
     return args
-
-def main():
-    global repopath, reponame, etcpath
-
-    # generate_config_template()
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.help or len(sys.argv) <= 1:
-        show_help()
-        sys.exit(0)
-
-    conf = BenchmarkConfig(args)
-
-    util.echo_line(util.line_width, "-", "🔥 Benchmark Configuration")
-    util.echo_info(conf.summary())
-
-    util.echo_line(util.line_width, "-", "🔥 Apply Plugins")
-    subprocess.run(
-        ["./bench_apply_plugin.sh", "sglang", "online", conf.output],
-        text=True,
-        check=True
-    )
-
-    if args.kill:
-        conf.kill_procs()
-        return
-    
-    for input in conf.inputs:
-        for backend in conf.backends:
-            for model in conf.models:
-                for parallel in conf.parallel:
-                    for batch in conf.batches:
-                        conf.set_curr(backend, model, parallel, batch, input)
-                        conf.input = input
-                        util.echo_line(util.line_width, "-", f"🫣 Test [{conf.cur_test:02}/{conf.num_test}]")
-                        if Path(conf.test_venv).is_dir():
-                            eval(f"bench_{backend}.bench_{conf.mode}(conf)")
-                        else:
-                            util.echo_warn(
-                                f"Skipping test: LLM inference engine '{backend}' is not installed "
-                                f"(expected at {conf.backend_info[backend]['venv']})."
-                            )
-                        print()
-
-if __name__ == "__main__":
-    main()
