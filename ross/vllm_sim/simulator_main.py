@@ -43,6 +43,14 @@ def _warn_pp_pre_forward_disabled(args) -> None:
             flush=True,
         )
 
+
+def _get_gpu_memory_utilization(args) -> float:
+    if hasattr(args, "gpu_memory_utilization"):
+        return args.gpu_memory_utilization
+    if hasattr(args, "gpu_model_utilization"):
+        return args.gpu_model_utilization
+    raise AttributeError("Missing gpu memory utilization on args")
+
 def parse_args():
     ap = argparse.ArgumentParser("ROSS VLLM simulator")
     ap.add_argument("--model-uri", type=str, default="")
@@ -88,6 +96,8 @@ def parse_args():
 
     args = ap.parse_args()
     args._explicit_pp_pre_forward_path = "--pp_pre_forward_path" in sys.argv
+    if not hasattr(args, "gpu_memory_utilization"):
+        args.gpu_memory_utilization = args.gpu_model_utilization
     return args
 
 def get_ross_models(model: BaseModel,
@@ -382,6 +392,7 @@ def load_memory_increase(path: str, filters: Dict[str, Any]) -> Dict[str, float]
 
 def run_sim(args):    
     _warn_pp_pre_forward_disabled(args)
+    gpu_memory_utilization = _get_gpu_memory_utilization(args)
     scheduler_kwargs = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
     }
@@ -417,7 +428,7 @@ def run_sim(args):
 
             memory_profiling=memory_increase,
             total_gpu_memory=platform_perf.theoretical_memory_gb * (1024 ** 3),
-            gpu_memory_utilization=args.gpu_memory_utilization,
+            gpu_memory_utilization=gpu_memory_utilization,
 
             ross_models=ross_model_dict,
             dp=args.dp_size, pp=args.pp_size,
@@ -440,7 +451,7 @@ def run_sim(args):
             prefill_memory_profiling=prefill_memory_increase,
             decode_memory_profiling=decode_memory_increase,
             total_gpu_memory=platform_perf.theoretical_memory_gb * (1024 ** 3),
-            gpu_memory_utilization=args.gpu_memory_utilization,
+            gpu_memory_utilization=gpu_memory_utilization,
 
             prefill_ross_models=prefill_ross_model_dict,
             decode_ross_models=decode_ross_model_dict,
@@ -449,6 +460,6 @@ def run_sim(args):
         )
 
     ret.update({
-        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "gpu_memory_utilization": gpu_memory_utilization,
     })
     return ret

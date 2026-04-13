@@ -25,6 +25,8 @@ from simulator_main import (
     get_ross_models,
     get_cached_platform_perf,
     get_cached_worker_config,
+    reset_sgl_predict_stats,
+    collect_sgl_predict_stats,
     update_metrics,
     calulcate_benchmark_results,
     check_sched_idle,
@@ -382,6 +384,7 @@ def run_simulation_disagg_aligned(
     post_decode_overhead_ms: float = 0.0,
 ):
     """Two-phase sim: prefill then decode with ready-time arrivals."""
+    reset_sgl_predict_stats(ross_models)
     workers_pq = PriorityQueue()
     prefill_workers: List[PrefillWorker] = []
     decode_workers: List[DecodeWorker] = []
@@ -493,6 +496,7 @@ def run_simulation_disagg_aligned(
         **benchmarks,
         "prefill_phases": [w.timing_phases for w in prefill_workers],
         "decode_phases": [w.timing_phases for w in decode_workers],
+        "sgl_predict_stats": collect_sgl_predict_stats(ross_models),
     }
     result_dict.update({
         "tokens/s": result_dict['throughput'],

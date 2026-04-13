@@ -130,6 +130,30 @@ def get_ross_models(model: BaseModel,
         )
     return model_dict
 
+
+def reset_sgl_predict_stats(ross_models: Dict[str, Any]) -> None:
+    for model in ross_models.values():
+        if hasattr(model, "reset_predict_stats"):
+            model.reset_predict_stats()
+
+
+def collect_sgl_predict_stats(ross_models: Dict[str, Any]) -> Dict[str, Any]:
+    stats = {}
+    total_calls = 0
+    total_time_s = 0.0
+    for name, model in ross_models.items():
+        if hasattr(model, "get_predict_stats"):
+            model_stats = model.get_predict_stats()
+            stats[name] = model_stats
+            total_calls += model_stats["predict_call_count"]
+            total_time_s += model_stats["predict_total_time_s"]
+    stats["summary"] = {
+        "predict_call_count": total_calls,
+        "predict_total_time_s": total_time_s,
+        "predict_avg_time_ms": (total_time_s * 1000.0 / total_calls) if total_calls > 0 else 0.0,
+    }
+    return stats
+
 def update_metrics(
     req: Request,
     wall_time: float,
@@ -195,6 +219,7 @@ def run_simulation(
     mem_fraction_static: float = 0.9,
     post_decode_overhead_ms: float = 0.0,
 ):
+    reset_sgl_predict_stats(ross_models)
     schedulers : List[Scheduler] = []
     prefill_phases, decode_phases = [], []
 
@@ -316,7 +341,14 @@ def run_simulation(
             check_sched_idle(schedulers[i], current_status[i]["batch_pipeline"], current_status[i]["step"], pp)
             for i in range(dp)
         )
-        if all_idle and request_list.should_terminate_idle(finished_reqs_count):
+        source_drained = (
+            request_list.next_to_admit_idx >= request_list.num_prompts
+            and request_list.inflight == 0
+        )
+        if all_idle and (
+            request_list.should_terminate_idle(finished_reqs_count)
+            or source_drained
+        ):
             break
 
     itl_list = []
@@ -332,6 +364,7 @@ def run_simulation(
         **benchmarks,
         "prefill_phases": prefill_phases,
         "decode_phases": decode_phases,
+        "sgl_predict_stats": collect_sgl_predict_stats(ross_models),
     }
     result_dict.update({
         "dp": dp,

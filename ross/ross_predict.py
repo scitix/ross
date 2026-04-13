@@ -20,7 +20,6 @@ sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, ".")
 sys.path.insert(0, str(Path(__file__).resolve().parent / "servers"))
 import util
-from api_server import call_bench_serving
 from bench_config import BenchmarkConfig, DEFAULT_RESERVE, parse_predict_args
 from common.loader import setup_logging
 from common.config import InferenceConfig, RuntimeConfig
@@ -35,6 +34,11 @@ from pareto.draw_pareto import draw_pareto_fronts
 # Backend lazy-load globals
 # ---------------------------------------------------------------------------
 _bench_mod = None   # bench_sglang or bench_vllm
+
+
+def _call_bench_serving(*args, **kwargs):
+    from api_server import call_bench_serving
+    return call_bench_serving(*args, **kwargs)
 
 
 def _load_backend_modules(backend: str):
@@ -127,6 +131,7 @@ class SimulationTask:
     hw_yaml: str
     gpu: str
     debug: bool
+    fast: bool = False
     # optional fields
     dataset: str = ""
     num_prompt: int = 0
@@ -169,9 +174,13 @@ def _tokens_per_user_from_tpot(mean_tpot_ms: float) -> float:
 def run_sim_predict(backend: str, model: str, parallel: str,
                     runtime_config: RuntimeConfig,
                     platform_perf_yaml: str,
-                    modeling_dir: str):
+                    modeling_dir: str,
+                    fast: bool = False):
     """Dispatch to the correct bench module based on backend."""
     is_disagg = "@" in parallel
+    extra_kwargs = {}
+    if backend == "vllm":
+        extra_kwargs["fast"] = fast
     if not is_disagg:
         dp, pp, tp = parallel.split(":")
         summary = _bench_mod.find_best_colocate_result_under_constraints(
@@ -180,6 +189,7 @@ def run_sim_predict(backend: str, model: str, parallel: str,
             runtime_config=runtime_config,
             platform_perf_yaml=platform_perf_yaml,
             modeling_dir=modeling_dir,
+            **extra_kwargs,
         )
     else:
         p_cfg, d_cfg = parallel.split("@")
@@ -192,6 +202,7 @@ def run_sim_predict(backend: str, model: str, parallel: str,
             runtime_config=runtime_config,
             platform_perf_yaml=platform_perf_yaml,
             modeling_dir=modeling_dir,
+            **extra_kwargs,
         )
     return summary.get_result_dict()
 
@@ -262,6 +273,7 @@ def run_single_sim(task: "SimulationTask") -> tuple:
             task.backend, task.model, task.parallel,
             task.runtime_config, task.hw_yaml,
             modeling_dir=task.modeling_dir,
+            fast=task.fast,
         )
         sim_elapsed_s = time.perf_counter() - sim_start_t
 
@@ -351,10 +363,10 @@ def _load_trace(task: "SimulationTask", args: Any) -> Optional[Dict[str, Any]]:
                     trace_args, debug=debug, stage_name="decode", req_name=req_name
                 )
                 if trace_result:
-                    trace_result.update({"prefill_phase": prefill_results})
+                    trace_result.update(
+                        {"prefill_phase": prefill_results.get("staged_timing_data")}
+                    )
 
-        if not trace_result or "duration" not in trace_result:
-            return None
         trace_result["throughput"] = trace_result.get("output_throughput", trace_result.get("throughput"))
         return trace_result
     except Exception:
@@ -416,6 +428,30 @@ def _process_result(
             do_comparison = False
         else:
             pe_dict = _compute_pe(sim_result_dict, trace_result_dict)
+
+    if task.debug:
+        for phase_name in ("timing_phases", "prefill_phases", "decode_phases"):
+            if phase_name in sim_result_dict:
+                tqdm_module.tqdm.write(
+                    f"[debug] {_task_brief(task)} {phase_name}={sim_result_dict.get(phase_name)}"
+                )
+        if "sgl_predict_stats" in sim_result_dict:
+            tqdm_module.tqdm.write(
+                f"[debug] {_task_brief(task)} sgl_predict_stats={sim_result_dict.get('sgl_predict_stats')}"
+            )
+        if trace_result_dict:
+            trace_phase_map = {
+                "staged_timing_data": "trace_staged_timing_data",
+                "prefill_phase": "trace_prefill_phase",
+                "timing_phases": "trace_timing_phases",
+                "prefill_phases": "trace_prefill_phases",
+                "decode_phases": "trace_decode_phases",
+            }
+            for src_name, debug_name in trace_phase_map.items():
+                if src_name in trace_result_dict:
+                    tqdm_module.tqdm.write(
+                        f"[debug] {_task_brief(task)} {debug_name}={trace_result_dict.get(src_name)}"
+                    )
 
     # ------------------------------------------------------------------
     # Build and print display DataFrame
@@ -610,10 +646,10 @@ def main():
                                 f"_batch_{batch}_promptnum_{conf.num_prompt}_rate_{rate}.jsonl"
                             )
                             if not os.path.exists(arrival_path):
-                                call_bench_serving(
+                                _call_bench_serving(
                                     model, backend, dataset, data_path,
                                     str(isl), str(osl), str(rate), str(conf.num_prompt),
-                                    arrival_path, str(batch),
+                                    arrival_path, str(batch), conf.random_range_ratio,
                                 )
 
                             # Inner scheduler param loop
@@ -650,6 +686,7 @@ def main():
                                     hw_yaml=hw_yaml,
                                     gpu=gpu.lower(),
                                     debug=args.debug,
+                                    fast=args.fast,
                                     dataset=dataset,
                                     num_prompt=conf.num_prompt,
                                     modeling_dir=conf.modeling_dir,

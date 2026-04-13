@@ -59,7 +59,7 @@ def _tokenize_local(text: str) -> tuple[int, float]:
 def _resolve_tokenization(rid: int, text: str) -> int:
     return _tokenize_local(text)
 
-def call_bench_serving(model, framework, dataset_name, dataset, isl, osl, rate, num_prompt, req_output, batch_size):
+def call_bench_serving(model, framework, dataset_name, dataset, isl, osl, rate, num_prompt, req_output, batch_size, random_range_ratio=0.0):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     ross_dir = os.path.dirname(script_dir)  # ross/ (parent of servers/)
     log_dir = os.path.join(ross_dir, "log")
@@ -70,7 +70,7 @@ def call_bench_serving(model, framework, dataset_name, dataset, isl, osl, rate, 
          os.path.join(log_dir, "launch_server.log"),
          os.path.join(log_dir, "client.log"),
          os.path.join(log_dir, "client_bench.log"),
-         batch_size],
+         batch_size, str(random_range_ratio)],
         text=True,
         check=True,
         cwd=ross_dir,

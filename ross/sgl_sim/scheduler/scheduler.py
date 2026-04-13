@@ -280,6 +280,11 @@ class Scheduler:
                     ):
                         insert_idx += 1
                     req_states.insert(insert_idx, (tokens_left, tokens_occupied))
+            elif req.needs_prefill() and not req.finished:
+                # Keep partially-prefilled requests queued even when they cannot
+                # be scheduled in this round; otherwise they are dropped from
+                # the scheduler and the simulator can spin with batch=None.
+                next_chunked.append(req)
 
         self.chunked_reqs = [
             req for req in next_chunked if req.needs_prefill() and not req.finished
@@ -460,9 +465,12 @@ class Scheduler:
 
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
+            if not self.running_batch.is_empty():
+                # Preserve the current decode batch when issuing a prefill batch
+                # in the same scheduling round; otherwise active decode requests
+                # are overwritten and disappear from future scheduling.
+                self.running_queue = [self.running_batch] + self.running_queue
             ret = new_batch
-            # self.running_queue = [self.running_batch] + self.running_queue
-            # self.running_batch = Batch(forward_mode="decode")
         else:
             if not self.running_batch.is_empty():
                 ret = self.running_batch

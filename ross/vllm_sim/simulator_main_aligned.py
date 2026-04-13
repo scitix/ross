@@ -22,6 +22,7 @@ from scheduler.request import Request, RequestStatus
 from scheduler.scheduler import Scheduler, SchedulerOutput
 
 from simulator_main import (
+    _get_gpu_memory_utilization,
     get_ross_model_paths,
     calulcate_benchmark_results,
     check_pipeline_clear,
@@ -409,6 +410,7 @@ def run_sim(args):
     if not args.disaggregation:
         return legacy_run_sim(args)
 
+    gpu_memory_utilization = _get_gpu_memory_utilization(args)
     scheduler_kwargs = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
     }
@@ -451,7 +453,7 @@ def run_sim(args):
         scheduler_kwargs=scheduler_kwargs,
         isl=args.max_prompt_len,
         osl=args.max_output_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_utilization=gpu_memory_utilization,
         prefill_memory_profiling=prefill_memory_increase,
         decode_memory_profiling=decode_memory_increase,
         total_gpu_memory=platform_perf.theoretical_memory_gb * (1024 ** 3),
@@ -459,7 +461,7 @@ def run_sim(args):
         pp=1,
     )
     ret.update({
-        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "gpu_memory_utilization": gpu_memory_utilization,
     })
     return ret
 

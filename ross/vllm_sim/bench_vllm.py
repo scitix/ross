@@ -37,6 +37,8 @@ def bench_online(
 
     if config_dict.get("disaggregation"):
         from simulator_main_aligned import run_sim
+    elif config_dict.get("fast"):
+        from simulator_main_fast import run_sim
     else:
         from simulator_main import run_sim
     
@@ -67,6 +69,7 @@ def find_best_colocate_result_under_constraints(
         runtime_config: RuntimeConfig,
         modeling_dir: str,
         platform_perf_yaml: str | None = None,
+        fast: bool = False,
         top_k: int = 1,
 ) -> InferenceSummary:
     results_df = pd.DataFrame(columns=SummaryColumns)
@@ -98,6 +101,7 @@ def find_best_colocate_result_under_constraints(
         "gpu_memory_utilization": runtime_config.scheduler_config["gpu_memory_utilization"],
 
         "disaggregation": False,
+        "fast": fast,
         "debug": False,
     })
 
@@ -113,6 +117,7 @@ def find_best_colocate_result_under_constraints(
 
     summary = InferenceSummary(runtime_config)
     summary.set_summary_df(results_df)
+    summary.set_result_dict(result_dict)
     return summary
 
 
@@ -123,6 +128,7 @@ def find_best_disagg_result_under_constraints(
         runtime_config: RuntimeConfig,
         modeling_dir: str,
         platform_perf_yaml: str | None = None,
+        fast: bool = False,
         top_k: int = 1,
 ) -> InferenceSummary:
     results_df = pd.DataFrame(columns=SummaryColumns)
@@ -154,6 +160,7 @@ def find_best_disagg_result_under_constraints(
         "gpu_memory_utilization": runtime_config.scheduler_config["gpu_memory_utilization"],
 
         "disaggregation": True,
+        "fast": fast,
         "debug": False,
     })
     
@@ -170,4 +177,5 @@ def find_best_disagg_result_under_constraints(
 
     summary = InferenceSummary(runtime_config)
     summary.set_summary_df(results_df)
+    summary.set_result_dict(result_dict)
     return summary

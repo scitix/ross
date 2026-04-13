@@ -88,17 +88,21 @@ def run_attention_torch(batch_size,
             scheduler_metadata=None,
             prefix_scheduler_metadata=None,
         )
-        attn = FlashAttentionImpl(
-            num_heads=num_heads,
-            head_size=head_dim,
-            scale=1.0/(head_dim**0.5),
-            num_kv_heads=num_key_value_heads,
-            alibi_slopes=None,
-            sliding_window=None,
-            kv_cache_dtype='fp8' if use_fp8_kv_cache else 'auto',
-            logits_soft_cap=None,
-            attn_type=AttentionType.DECODER,
-        )
+        try:
+            attn = FlashAttentionImpl(
+                num_heads=num_heads,
+                head_size=head_dim,
+                scale=1.0/(head_dim**0.5),
+                num_kv_heads=num_key_value_heads,
+                alibi_slopes=None,
+                sliding_window=None,
+                kv_cache_dtype='fp8' if use_fp8_kv_cache else 'auto',
+                logits_soft_cap=None,
+                attn_type=AttentionType.DECODER,
+            )
+        except NotImplementedError as e:
+            print(f"Skipping unsupported config (fp8_kv={use_fp8_kv_cache}): {e}")
+            return
         class DummyLayer(torch.nn.Module):
             def __init__(self, num_heads, num_key_value_heads, head_dim, device):
                 super().__init__()

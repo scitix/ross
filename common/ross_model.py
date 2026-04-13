@@ -1,6 +1,7 @@
 import json
 import os
 import math
+import time
 import numpy as np
 import xgboost as xgb
 import joblib
@@ -150,6 +151,34 @@ class ROSSModel:
 
 
 class SGLROSSModel(ROSSModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reset_predict_stats()
+
+    def reset_predict_stats(self) -> None:
+        self.predict_call_count = 0
+        self.predict_total_time_s = 0.0
+        self.predict_feature_time_s = 0.0
+        self.predict_model_time_s = 0.0
+
+    def get_predict_stats(self) -> Dict[str, float]:
+        avg_time_ms = 0.0
+        if self.predict_call_count > 0:
+            avg_time_ms = self.predict_total_time_s * 1000.0 / self.predict_call_count
+        feature_avg_time_ms = 0.0
+        model_avg_time_ms = 0.0
+        if self.predict_call_count > 0:
+            feature_avg_time_ms = self.predict_feature_time_s * 1000.0 / self.predict_call_count
+            model_avg_time_ms = self.predict_model_time_s * 1000.0 / self.predict_call_count
+        return {
+            "predict_call_count": self.predict_call_count,
+            "predict_total_time_s": self.predict_total_time_s,
+            "predict_avg_time_ms": avg_time_ms,
+            "predict_feature_time_s": self.predict_feature_time_s,
+            "predict_feature_avg_time_ms": feature_avg_time_ms,
+            "predict_model_time_s": self.predict_model_time_s,
+            "predict_model_avg_time_ms": model_avg_time_ms,
+        }
 
     def _extract_features(self,
                           req_ids: List[str],
@@ -165,5 +194,15 @@ class SGLROSSModel(ROSSModel):
     def predict(self, req_ids: List[str], seq_lens: List[int]) -> float:
         if not req_ids:
             return 0
+        start_t = time.perf_counter()
+        feature_start_t = start_t
         feature_vals = self._extract_features(req_ids, seq_lens)
-        return self._run_prediction(feature_vals)
+        feature_end_t = time.perf_counter()
+        model_start_t = feature_end_t
+        prediction = self._run_prediction(feature_vals)
+        model_end_t = time.perf_counter()
+        self.predict_call_count += 1
+        self.predict_feature_time_s += feature_end_t - feature_start_t
+        self.predict_model_time_s += model_end_t - model_start_t
+        self.predict_total_time_s += model_end_t - start_t
+        return prediction

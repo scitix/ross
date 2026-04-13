@@ -83,7 +83,8 @@ def load_traces(args, debug=False, stage_name = '', req_name = None):
 
     if not main_client_log:
         raise RuntimeError("No trace logs found.")
-    print(f"[trace] loading client log: {main_client_log}")
+    if req_name is None or stage_name == "prefill":
+        print(f"[trace] loading client log: {main_client_log}")
 
     bench_results = get_bench_results(main_client_log)
     ttft = dict()

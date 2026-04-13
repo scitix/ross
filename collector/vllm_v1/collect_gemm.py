@@ -15,31 +15,21 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size,init_distributed_environment
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, init_distributed_environment, initialize_model_parallel
 from vllm.version import __version__ as vllm_version
 import torch.distributed as dist
 from helper import getSMVersion, log_perf
 
 # If we want to use advanced linear implementations like MergedColumnParallelLinear and RowParallelLinear
 # we need to unit and destroy TP and rank group before and after each test case
-def setup_distributed():
-    os.environ["RANK"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "8889"
-    init_distributed_environment()
-
-def destroy_distributed():
-    torch.distributed.destroy_process_group()
-
 def get_gemm_test_cases(is_unit_test=False):
     x_list = [1, 16, 128, 1024, 4096, 8192]
     nk_list = [256, 1024, 3584, 8192, 16384]
     nk_list_ext = [16384, 65536]
     #gemm_list = ['float16']
     gemm_list = ['awq','gptq']
-    if getSMVersion() < 86:
-        gemm_list += ['fp8','fp8_block','awq','gptq']
+    if getSMVersion() >= 89:
+        gemm_list += ['fp8','fp8_block']
     
     if is_unit_test:
         x_list = [1,2,4,8]
@@ -59,9 +49,21 @@ def get_gemm_test_cases(is_unit_test=False):
                     test_cases.append([gemm_type,x,n,k,'gemm_perf_vllm.txt'])
     return test_cases
 
+def _ensure_distributed(device):
+    """Initialize vLLM distributed env and TP group once per worker process."""
+    if not torch.distributed.is_initialized():
+        device_id = device.index if isinstance(device, torch.device) else int(str(device).split(':')[-1])
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(29500 + device_id)
+        init_distributed_environment()
+        initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
 def run_gemm(gemm_type, m, n, k, perf_filename, device='cuda:0'):
     torch.set_default_dtype(torch.float16)
     torch.cuda.set_device(device)
+    _ensure_distributed(device)
     dtype = torch.float16
     x = torch.randn((m, k), dtype=dtype).to(torch.device(device))
     w = torch.randn((k, n), dtype=dtype).to(torch.device(device))

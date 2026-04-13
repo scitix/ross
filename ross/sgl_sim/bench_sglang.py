@@ -109,6 +109,7 @@ def find_best_colocate_result_under_constraints(
 
     summary = InferenceSummary(runtime_config)
     summary.set_summary_df(results_df)
+    summary.set_result_dict(result_dict)
     return summary
 
 
@@ -169,4 +170,5 @@ def find_best_disagg_result_under_constraints(
 
     summary = InferenceSummary(runtime_config)
     summary.set_summary_df(results_df)
+    summary.set_result_dict(result_dict)
     return summary

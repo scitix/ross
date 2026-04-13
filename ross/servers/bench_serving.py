@@ -1626,8 +1626,10 @@ def sample_repoqa_requests(
     max_output_len: Optional[int] = 0,
     apply_chat_template: bool = False,
 ) -> List[DatasetRow]:
-    if fixed_output_len is not None and fixed_output_len < 1:
+    if fixed_output_len is not None and fixed_output_len < 0:
         raise ValueError("output_len too small")
+    if fixed_output_len == 0:
+        fixed_output_len = None
     if not dataset_path:
         raise ValueError("RepoQA requires --dataset-path")
     max_prompt_len = 0 if max_prompt_len is None else max_prompt_len
@@ -1710,8 +1712,10 @@ def sample_aime_requests(
     max_output_len: Optional[int] = 0,
     apply_chat_template: bool = False,
 ) -> List[DatasetRow]:
-    if fixed_output_len is not None and fixed_output_len < 1:
+    if fixed_output_len is not None and fixed_output_len < 0:
         raise ValueError("output_len too small")
+    if fixed_output_len == 0:
+        fixed_output_len = None
     max_prompt_len = 0 if max_prompt_len is None else max_prompt_len
     max_output_len = 0 if max_output_len is None else max_output_len
 

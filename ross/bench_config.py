@@ -29,7 +29,7 @@ DEFAULT_MODELING_DIR = str(Path(repopath) / "modeling")
 
 avail_backends   = ["vllm", "sglang", "tensorrt"]
 avail_mode       = ["online", "offline"]
-avail_dataset    = ["sharegpt", "repoqa", "aime"]
+avail_dataset    = ["sharegpt", "random", "repoqa", "aime"]
 DEFAULT_MODE     = "online"
 DEFAULT_GPU      = "H200"
 DEFAULT_MODELS   = "Qwen2.5-72B-Instruct"
@@ -40,6 +40,7 @@ DEFAULT_INPUT    = "sharegpt@0_0"
 DEFAULT_RESERVE  = 0.9
 DEFAULT_CHUNK_PREFILL_SIZE = 8192
 DEFAULT_MODEL_SEARCH_PATHS = ["~/models"]
+DEFAULT_RANDOM_RANGE_RATIO = 0.0
 
 class BenchmarkConfig:
     """
@@ -79,6 +80,7 @@ class BenchmarkConfig:
 
         self.output       = args.output
         self.datapath     = args.datapath
+        self.random_range_ratio = args.random_range_ratio
         self.model_search_paths = self._as_list(args.model_search_paths) if getattr(args, "model_search_paths", None) else []
         self.config       = str(Path(args.config).expanduser().resolve()) if args.config else None
         self.modeling_dir = args.modeling_dir if hasattr(args, "modeling_dir") else None
@@ -131,7 +133,7 @@ class BenchmarkConfig:
         self.parallel = self._split(self.parallel)
         for input in ([self.input] + self.inputs):
             location = ""
-            if input["dataset"] == "sharegpt":
+            if input["dataset"] in {"sharegpt", "random"}:
                 location = f"{self.datapath}/ShareGPT_V3_unfiltered_cleaned_split.json"
             elif input["dataset"] == "repoqa":
                 location = f"{self.datapath}/repoqa.jsonl"
@@ -168,6 +170,8 @@ class BenchmarkConfig:
             self.datapath =  str(Path(etcpath).expanduser().resolve())
         if not self.modeling_dir:
             self.modeling_dir = DEFAULT_MODELING_DIR
+        if self.random_range_ratio is None:
+            self.random_range_ratio = DEFAULT_RANDOM_RANGE_RATIO
         if not self.model_search_paths:
             self.model_search_paths = list(DEFAULT_MODEL_SEARCH_PATHS)
         for key in self.args.keys():
@@ -217,6 +221,8 @@ class BenchmarkConfig:
                 self.output = str(Path(conf["output"]).expanduser().resolve())
             if not self.datapath and "datapath" in conf.keys():
                 self.datapath = str(Path(conf["datapath"]).expanduser().resolve())
+            if self.random_range_ratio is None and "random_range_ratio" in conf.keys():
+                self.random_range_ratio = float(conf["random_range_ratio"])
             if not self.modeling_dir and "modeling_dir" in conf.keys():
                 self.modeling_dir = str(Path(conf["modeling_dir"]).expanduser().resolve())
             if not self.model_search_paths and "model_search_paths" in conf.keys():
@@ -455,6 +461,7 @@ class BenchmarkConfig:
         s.append(f"       Rates        : {self.rates}")
         s.append(f"       Inputs       : {[inp.get('dataset','?') + '@' + str(inp.get('isl',('?','?'))[0]) + '_' + str(inp.get('osl',('?','?'))[0]) for inp in self.inputs]}")
         s.append(f"       Output       : {self.output}")
+        s.append(f"       Random ratio : {self.random_range_ratio}")
         s.append(f"       Modeling dir : {self.modeling_dir}")
         s.append(f"       Model search : {self.model_search_paths}")
         s.append(f"       Config       : {self.config}")
@@ -477,6 +484,7 @@ def build_parser():
     parser.add_argument("--input",      type=str,   help="Dataset input spec")
     parser.add_argument("--output",     type=str,   help="Output directory")
     parser.add_argument("--datapath",   type=str,   help="Absolute path to dataset directory")
+    parser.add_argument("--random-range-ratio", type=float, dest="random_range_ratio", help=f"Range ratio for bench_serving random dataset (default: {DEFAULT_RANDOM_RANGE_RATIO})")
     parser.add_argument("--config",       type=str,   help="Path to JSON config file")
     parser.add_argument("--modeling-dir", type=str,   dest="modeling_dir", help=f"Path to modeling directory containing xgboost models (default: {DEFAULT_MODELING_DIR})")
     parser.add_argument("--model-search-paths", type=str, dest="model_search_paths", help="Comma-separated model search roots used to resolve model names")
@@ -538,6 +546,8 @@ SHARED OPTIONS  (see docs/bench_config.md for full reference)
                            execution traces. Not read in pure forward-
                            prediction mode.
   --datapath PATH          Absolute path to dataset directory.
+  --random-range-ratio R   Range ratio forwarded to bench_serving random dataset.
+                           Default: {DEFAULT_RANDOM_RANGE_RATIO}
   --model-search-paths     Comma-separated model search roots used to resolve model names.
   --modeling-dir PATH      Path to xgboost model directory.
                            Default: <repo_root>/modeling
@@ -552,6 +562,7 @@ PREDICT-ONLY OPTIONS
 ────────────────────────────────────────────────────────────────────────────
 
   --debug                  Enable verbose/DEBUG-level logging.
+  --fast                   Use the fast vLLM simulator entry when available.
   --record-path FILE       Write per-configuration PE metrics to a CSV file.
   --eval                   Load real trace logs and compare against simulator results.
 
@@ -572,6 +583,7 @@ CONFIG FILE EXAMPLE
       "batch":   [32],
       "rate":    ["1", "2", "4", "inf"],
       "input":   "sharegpt@0_0",
+      "random_range_ratio": 0.0,
       "model_search_paths": ["~/models"],
       "modeling_dir": "~/modeling",
       "platforms": [{{"gpu": "H200", "version": "0.6.6.post1"}}],
@@ -592,11 +604,13 @@ def build_predict_parser():
     # ── predict-specific arguments ──────────────────────────────────────────
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable verbose/DEBUG-level logging.")
+    parser.add_argument("--fast", action="store_true", default=False,
+                        help="Use the fast vLLM simulator entry when available.")
     parser.add_argument("--record-path", type=str, default="", metavar="FILE",
                         help="Write per-configuration PE metrics to a CSV file.")
     parser.add_argument("--eval", action="store_true", default=False,
                         help="Load real trace logs and compare against simulator results.")
-    parser.add_argument("--max-workers", type=int, default=0,
+    parser.add_argument("--max-workers", "--max-worker", dest="max_workers", type=int, default=0,
                         help="Number of parallel worker processes. 0=auto.")
     parser.add_argument("--threads-per-worker", type=int, default=0,
                         help="CPU threads per worker process. 0=auto.")

@@ -35,6 +35,7 @@ bench_setup_server(){
     local client_log=${11}
     local client_bench_log=${12}
     local batch_size=${13}
+    local random_range_ratio=${14}
     local tokenize_log="${LOG_DIR}/sgl_tokenize_server.log"
     local tokenize_pid=""
 
@@ -65,7 +66,16 @@ bench_setup_server(){
     client_args="cd ${SCRIPT_DIR}/servers && python3 bench_serving.py --backend=sglang --num-prompts=${num_prompt} --max-concurrency=${batch_size}"
     client_args="${client_args} --model=${model} --dataset-name=${dataset_name} --dataset-path=${dataset}"
     client_args="${client_args} --host=127.0.0.1 --port=8000"
-    client_args="${client_args} --sharegpt-prompt-len ${isl} --sharegpt-output-len ${osl} --request-rate=${rate}"
+    if [[ $dataset_name == 'random' ]]; then
+        client_args="${client_args} --random-input-len ${isl} --random-output-len ${osl} --random-range-ratio ${random_range_ratio}"
+    elif [[ $dataset_name == 'repoqa' ]]; then
+        client_args="${client_args} --repoqa-prompt-len ${isl} --repoqa-output-len ${osl}"
+    elif [[ $dataset_name == 'aime' ]]; then
+        client_args="${client_args} --aime-prompt-len ${isl} --aime-output-len ${osl}"
+    else
+        client_args="${client_args} --sharegpt-prompt-len ${isl} --sharegpt-output-len ${osl}"
+    fi
+    client_args="${client_args} --request-rate=${rate}"
     echo_back "${client_args} --output-file ${client_bench_log} > ${client_log} 2>&1"
     
     pkill -9 -f "python3 tokenize_server.py"
@@ -76,4 +86,4 @@ bench_setup_server(){
 #################### * Main Process * ####################
 ##########################################################
 
-bench_setup_server $1 $2 $3 $4 $5 $6 $7 $8 $9 ${10} ${11} ${12} ${13}
+bench_setup_server $1 $2 $3 $4 $5 $6 $7 $8 $9 ${10} ${11} ${12} ${13} ${14}
