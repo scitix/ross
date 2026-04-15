@@ -5,6 +5,7 @@ import logging
 import pandas as pd
 
 from common.config import RuntimeConfig
+from common.models import is_moe_model
 
 logger = logging.getLogger(__name__)
 
@@ -72,13 +73,8 @@ RECORD_COMPARISON_COLS = [
 
 RECORD_NO_COMPARISON_COLS = ["duration", "mean_ttft_ms", "mean_tpot_ms", "mean_itl_ms", "throughput"]
 
-MOE_MODELS = ["deepseek", "qwen3-235b-a22b", "qwen3-30b-a3b", "mistral"]
-
 def is_moe(model_uri: str):
-    for moe_model in MOE_MODELS:
-        if model_uri.lower().find(moe_model) != -1: 
-            return True
-    return False
+    return is_moe_model(model_uri)
     
 class InferenceSummary:
     """

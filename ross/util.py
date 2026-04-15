@@ -265,14 +265,12 @@ def get_model(model: str, search_roots=None) -> str:
         base_dir = Path(base).expanduser().resolve()
         if not base_dir.is_dir():
             continue
-
         # find equivalent: find ${path} -name model
         # glob "**/name" recursively
         found = list(base_dir.glob(f"**/{model}"))
         if not found:
             continue
         p = found[0].resolve()
-
         if not (p / "config.json").exists() and (p / "v1.0").is_dir():
             p = p / "v1.0"
 

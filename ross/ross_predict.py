@@ -179,7 +179,7 @@ def run_sim_predict(backend: str, model: str, parallel: str,
     """Dispatch to the correct bench module based on backend."""
     is_disagg = "@" in parallel
     extra_kwargs = {}
-    if backend == "vllm":
+    if backend in {"vllm", "sglang"}:
         extra_kwargs["fast"] = fast
     if not is_disagg:
         dp, pp, tp = parallel.split(":")

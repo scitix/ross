@@ -23,27 +23,90 @@ def _first_defined(configs: Dict[str, Any], keys: list[str], default: int = 0) -
     return default
 
 
-def _load_model_weights() -> Dict[str, float]:
-    """Load model weight table from model_weights.yaml next to this file."""
+def _load_model_metadata() -> Dict[str, Dict[str, Any]]:
+    """Load model metadata table from model_weights.yaml next to this file."""
     yaml_path = Path(__file__).with_name("model_weights.yaml")
     with open(yaml_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    return {k: float(v) for k, v in data.items()}
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for model_name, value in data.items():
+        if isinstance(value, dict):
+            weight_gib = value.get("weight_gib")
+            is_moe = bool(value.get("is_moe", False))
+        else:
+            weight_gib = value
+            is_moe = False
+        metadata[model_name] = {
+            "weight_gib": float(weight_gib),
+            "is_moe": is_moe,
+        }
+    return metadata
 
 
-MODEL_WEIGHTS: Dict[str, float] = _load_model_weights()
+MODEL_METADATA: Dict[str, Dict[str, Any]] = _load_model_metadata()
+MODEL_WEIGHTS: Dict[str, float] = {
+    model_name: metadata["weight_gib"]
+    for model_name, metadata in MODEL_METADATA.items()
+}
+
+
+def lookup_model_metadata(model_uri: str) -> Dict[str, Any] | None:
+    for model_name, metadata in MODEL_METADATA.items():
+        if model_name in model_uri:
+            return metadata
+    return None
+
+
+def is_moe_model(model_uri: str) -> bool:
+    metadata = lookup_model_metadata(model_uri)
+    return bool(metadata and metadata.get("is_moe"))
+
+
+def _normalize_model_config(model_configs: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten HuggingFace-style nested text configs into one dict.
+
+    Some multimodal checkpoints keep the LLM fields under ``text_config`` while
+    ROSS expects a plain text-model config at the top level.
+    """
+    normalized = dict(model_configs)
+    text_config = normalized.get("text_config")
+    if isinstance(text_config, dict):
+        for key, value in text_config.items():
+            normalized.setdefault(key, value)
+
+    if "intermediate_size" not in normalized or normalized["intermediate_size"] is None:
+        moe_inter_size = _first_defined(
+            normalized,
+            ["moe_intermediate_size", "expert_intermediate_size", "ffn_dim"],
+        )
+        shared_inter_size = _first_defined(
+            normalized,
+            [
+                "shared_expert_intermediate_size",
+                "shared_moe_intermediate_size",
+                "shared_ffn_intermediate_size",
+            ],
+        )
+        topk = _first_defined(
+            normalized,
+            ["num_experts_per_tok", "num_experts_per_token", "moe_top_k", "top_k", "topk"],
+            default=1,
+        )
+        if moe_inter_size > 0 or shared_inter_size > 0:
+            normalized["intermediate_size"] = shared_inter_size + topk * moe_inter_size
+    return normalized
 
 def get_model(model_uri: str,
             inference_config: InferenceConfig
             ) -> BaseModel:
     with open(os.path.join(model_uri, 'config.json'), 'r') as f:
-            model_configs = json.load(f)
+            model_configs = _normalize_model_config(json.load(f))
 
     # by default: using llama models
     weights_from_config = 0
-    for k, v in MODEL_WEIGHTS.items():
-        if k in model_uri:
-            weights_from_config = v
+    metadata = lookup_model_metadata(model_uri)
+    if metadata is not None:
+        weights_from_config = metadata["weight_gib"]
 
     model_configs['model_uri'] = model_uri
     model = LLAMAModel(model_configs, inference_config, weights_from_config)

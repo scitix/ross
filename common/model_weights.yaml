@@ -1,34 +1,42 @@
-# Model weight lookup table — total FP16 weight size in GiB.
+# Model metadata lookup table.
 # Used by get_model() as a fast path: when the model URI contains any of the
-# keys below (case-sensitive substring match), this value is used directly
-# instead of computing weights from ops.
+# keys below (case-sensitive substring match), the recorded FP16 weight size
+# is used directly instead of computing weights from ops.
 #
-# Format: "model_name_fragment": size_in_GiB
+# Format:
+#   "model_name_fragment":
+#     weight_gib: <float>
+#     is_moe: <bool>
 
-# ── 70B-class dense ──────────────────────────────────────────────────────────
-DeepSeek-R1-Distill-Llama-70B: 131.68
-Meta-Llama-3.1-70B-Instruct: 131.56
+# 70B-class dense
+DeepSeek-R1-Distill-Llama-70B: {weight_gib: 131.68, is_moe: false}
+Meta-Llama-3.1-70B-Instruct: {weight_gib: 131.56, is_moe: false}
 
-# ── 32B-class dense ──────────────────────────────────────────────────────────
-Qwen3-32B: 61.2
-QwQ-32B: 61.2
-Qwen2.5-32B: 61.56
-Qwen2.5-32B-Instruct: 61.56
+# 32B-class dense
+Qwen3-32B: {weight_gib: 61.2, is_moe: false}
+QwQ-32B: {weight_gib: 61.2, is_moe: false}
+Qwen2.5-32B: {weight_gib: 61.56, is_moe: false}
+Qwen2.5-32B-Instruct: {weight_gib: 61.56, is_moe: false}
 
-# ── 72B dense ────────────────────────────────────────────────────────────────
-Qwen2.5-72B-Instruct: 136.0
+# 72B dense
+Qwen2.5-72B-Instruct: {weight_gib: 136.0, is_moe: false}
 
-# ── MoE (sparse) ─────────────────────────────────────────────────────────────
-Qwen3-235B-A22B: 439.36
-Qwen3-30B-A3B: 55.8
-DeepSeek-V3-0324: 636.96   # was 680 before correction
+# MoE (sparse)
+Qwen3-235B-A22B: {weight_gib: 439.36, is_moe: true}
+Qwen3-30B-A3B: {weight_gib: 55.8, is_moe: true}
+Qwen3-35B-A3B: {weight_gib: 71.9, is_moe: true}
+Qwen3.5-122B-A10B: {weight_gib: 250.0, is_moe: true}
 
-# ── Small / 7–8B ─────────────────────────────────────────────────────────────
-Llama-2-7b-chat-hf: 12.55
-Qwen2.5-7B-Instruct: 14.25
-Meta-Llama-3.1-8B-Instruct: 14.99
+DeepSeek-V3-0324: {weight_gib: 636.96, is_moe: true}
 
-# ── Other ────────────────────────────────────────────────────────────────────
-gemma-2-27b-it: 50.92
-gpt-oss-20b: 14.32
-gpt-oss-120b: 69.28
+Mistral-8x7B: {weight_gib: 86.0, is_moe: true}
+
+gpt-oss-20b: {weight_gib: 14.32, is_moe: true}
+gpt-oss-120b: {weight_gib: 69.28, is_moe: true}
+
+gemma-4-31B-it: {weight_gib: 62.6, is_moe: true}
+
+# Small / 7-8B
+Llama-2-7b-chat-hf: {weight_gib: 12.55, is_moe: false}
+Qwen2.5-7B-Instruct: {weight_gib: 14.25, is_moe: false}
+Meta-Llama-3.1-8B-Instruct: {weight_gib: 14.99, is_moe: false}

@@ -6,10 +6,10 @@
     "parallel": ["1:1:4@1:1:4"],
     "batch": [128],
     "num_prompt": 512,
-    "inputs": ["repoqa@11736_373"],
+    "inputs": ["repoqa@0_0"],
     "output": "~/.etc",
     "datapath": "~/.etc",
-    "model_search_paths": "/volume/hisys/ycao/models/preset_models",
+    "model_search_paths": "/models",
     "ross_extra": [
         {
             "backend": "sglang",

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def _resolve_sgl_model_paths(modeling_dir: str, moe: bool) -> dict:
     """Build xgboost model path dict from a single modeling_dir root."""
-    fwd_dir = "moe_foward" if moe else "dense"   # preserve upstream typo
+    fwd_dir = "moe_forward" if moe else "dense"   # preserve upstream typo
     base    = Path(modeling_dir) / "sgl"
     return {
         "prefill_pre_forward_path":  str(base / f"dense/prefill/pre_forward_trained_models/xgboost_model"),
@@ -39,6 +39,8 @@ def bench_online(
 
     if config_dict["disaggregation"]:
         from simulator_main_aligned import run_sim
+    elif config_dict.get("fast"):
+        from simulator_main_fast import run_sim
     else:
         from simulator_main import run_sim
         
@@ -66,6 +68,7 @@ def find_best_colocate_result_under_constraints(
         runtime_config: RuntimeConfig,
         modeling_dir: str,
         platform_perf_yaml: str | None = None,
+        fast: bool = False,
         top_k: int = 1,
         cache_worker_config: bool = False,
 ) -> InferenceSummary:
@@ -94,6 +97,7 @@ def find_best_colocate_result_under_constraints(
         "reserved_decode_tokens": 512,
 
         "disaggregation": False,
+        "fast": fast,
         "cache_worker_config": cache_worker_config,
     })
 
@@ -121,6 +125,7 @@ def find_best_disagg_result_under_constraints(
         modeling_dir: str,
         gpu: str = '',
         platform_perf_yaml: str | None = None,
+        fast: bool = False,
         top_k: int = 1,
         cache_worker_config: bool = False,
 ) -> InferenceSummary:
