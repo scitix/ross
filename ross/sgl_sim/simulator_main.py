@@ -25,9 +25,20 @@ from common.ross_model import SGLROSSModel
 
 import logging
 logger = logging.getLogger(__name__)
+_SIM_PREFIX_CACHE_CLS = None
 
-_PLATFORM_PERF_CACHE: Dict[str, PlatformPerf] = {}
-_WORKER_CONFIG_CACHE: Dict[Tuple[str, str, int, int, Tuple[Tuple[str, str], ...]], Tuple[BaseModel, Dict[str, Any], InferenceConfig]] = {}
+
+def _get_sim_prefix_cache_cls():
+    return _SIM_PREFIX_CACHE_CLS
+
+
+def _load_sim_prefix_cache():
+    global _SIM_PREFIX_CACHE_CLS
+    if _SIM_PREFIX_CACHE_CLS is not None:
+        return _SIM_PREFIX_CACHE_CLS
+    from common.prefix_cache import SimPrefixCache
+    _SIM_PREFIX_CACHE_CLS = SimPrefixCache
+    return _SIM_PREFIX_CACHE_CLS
 
 def parse_args():
     ap = argparse.ArgumentParser("ROSS SGLANG simulator")
@@ -52,6 +63,7 @@ def parse_args():
     ap.add_argument("--mem-fraction-static", type=float, default=0.9)
     ap.add_argument("--chunked-prefill-size", type=int, default=16384)
     ap.add_argument("--reserved-decode-tokens", type=int, default=512)
+    ap.add_argument("--enable-prefix-caching", action="store_true", default=False)
 
     # Workload Config
     ap.add_argument("--batch-size", type=int, required=True)
@@ -72,44 +84,7 @@ def parse_args():
     ap.add_argument('--decode_pre_forward_path', type=str, required=True, help='Path to the Saved PRE-FORWARD Model file.')
     ap.add_argument('--decode_forward_path', type=str, required=True, help='Path to the Saved [Decode] FORWARD Model file.')
     ap.add_argument('--decode_post_forward_path', type=str, required=True, help='Path to the Saved [Decode] POST-FORWARD Model file.')
-    ap.add_argument('--cache-worker-config', action='store_true', default=False, help='Cache heavy simulator objects within each worker process.')
-
     return ap.parse_args()
-
-
-def get_cached_platform_perf(platform_perf_yaml: str) -> PlatformPerf:
-    platform_perf = _PLATFORM_PERF_CACHE.get(platform_perf_yaml)
-    if platform_perf is None:
-        platform_perf = PlatformPerf(platform_perf_yaml=platform_perf_yaml)
-        _PLATFORM_PERF_CACHE[platform_perf_yaml] = platform_perf
-    return platform_perf
-
-
-def get_cached_worker_config(
-    model_uri: str,
-    platform_perf_yaml: str,
-    tp_size: int,
-    pp_size: int,
-    model_path: Dict[str, str],
-) -> Tuple[BaseModel, Dict[str, Any], InferenceConfig]:
-    model_path_items = tuple(sorted(model_path.items()))
-    cache_key = (model_uri, platform_perf_yaml, tp_size, pp_size, model_path_items)
-    cached = _WORKER_CONFIG_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    platform_perf = get_cached_platform_perf(platform_perf_yaml)
-    inference_config = InferenceConfig(tp_size=tp_size, pp_size=pp_size)
-    model = get_model(model_uri, inference_config)
-    ross_model_dict = get_ross_models(
-        model,
-        platform_perf,
-        inference_config,
-        model_path=model_path,
-    )
-    cached = (model, ross_model_dict, inference_config)
-    _WORKER_CONFIG_CACHE[cache_key] = cached
-    return cached
 
 def get_ross_models(model: BaseModel,
                     platform_perf: PlatformPerf,
@@ -222,6 +197,7 @@ def run_simulation(
     reset_sgl_predict_stats(ross_models)
     schedulers : List[Scheduler] = []
     prefill_phases, decode_phases = [], []
+    enable_prefix_caching = bool(scheduler_kwargs.get("enable_prefix_caching", False))
 
     for idx in range(dp):
         kv_pool = SGLKVCachePool(
@@ -232,6 +208,10 @@ def run_simulation(
             gpu_memory_utilization=mem_fraction_static,
             framework='sglang',
         )
+        if enable_prefix_caching:
+            kv_pool.enable_prefix_cache(
+                _SIM_PREFIX_CACHE_CLS(page_size=kv_pool.page_size)
+            )
         schedulers.append(Scheduler(
             waiting_queue=[],
             kv_pool=kv_pool,
@@ -401,16 +381,15 @@ def run_sim(args):
         "chunked_prefill_size": args.chunked_prefill_size,
         "reserved_decode_tokens": args.reserved_decode_tokens,
         "max_running_requests": args.batch_size,
+        "enable_prefix_caching": getattr(args, "enable_prefix_caching", False),
     }
+    prefix_cache_cls = None
+    if scheduler_kwargs["enable_prefix_caching"]:
+        _load_sim_prefix_cache()
     if args.model_uri.lower().find("deepseek") != -1:
         scheduler_kwargs.update({"page_size": 64})
 
-    use_cache = getattr(args, "cache_worker_config", False)
-    platform_perf = (
-        get_cached_platform_perf(args.platform_perf)
-        if use_cache
-        else PlatformPerf(platform_perf_yaml=args.platform_perf)
-    )
+    platform_perf = PlatformPerf(platform_perf_yaml=args.platform_perf)
 
     def _init_worker_config(tp_size: int, pp_size: int, model_path: Dict[str, str]):
         inference_config = InferenceConfig(tp_size=tp_size, pp_size=pp_size)
@@ -437,20 +416,11 @@ def run_sim(args):
             "decode_forward": args.decode_forward_path,
             "decode_post_forward": args.decode_post_forward_path,
         }
-        if use_cache:
-            model, ross_model_dict, _ = get_cached_worker_config(
-                model_uri=args.model_uri,
-                platform_perf_yaml=args.platform_perf,
-                tp_size=args.tp_size,
-                pp_size=args.pp_size,
-                model_path=model_path,
-            )
-        else:
-            model, ross_model_dict, _ = _init_worker_config(
-                tp_size=args.tp_size,
-                pp_size=args.pp_size,
-                model_path=model_path,
-            )
+        model, ross_model_dict, _ = _init_worker_config(
+            tp_size=args.tp_size,
+            pp_size=args.pp_size,
+            model_path=model_path,
+        )
         ret = run_simulation(
             model=model,
             batch_size=args.batch_size,
@@ -467,13 +437,8 @@ def run_sim(args):
     else:
         raise RuntimeError("Run DISAGG in simulator_aligned.py")
 
+    ret.update(scheduler_kwargs)
     ret.update({
         "mem_fraction_static": args.mem_fraction_static,
-        "chunked_prefill_size": args.chunked_prefill_size
     })
     return ret
-
-if __name__ == "__main__":
-    args = parse_args()
-    ret = run_sim(args)
-    print(f"[SIM] result={ret}")

@@ -36,7 +36,9 @@ class KVAllocWrapper:
         block_size = self._kv_block_size()
         num_allocated_blocks = self.kv_pool.get_allocated_block_count(request.request_id)
         capacity_tokens = num_allocated_blocks * block_size
-        slack = max(0, capacity_tokens - request.num_computed_tokens)
+        cached_tokens = self.kv_pool.get_cached_token_count(request.request_id)
+        used_private_tokens = max(0, request.num_computed_tokens - cached_tokens)
+        slack = max(0, capacity_tokens - used_private_tokens)
 
         # logger.debug(f"    [ALLOC] req {request.request_id} num_allocated_blocks: {num_allocated_blocks}\n"
         #              f"    [ALLOC] req {request.request_id} capacity_tokens: {capacity_tokens}; request_num_computed_tokens: {request.num_computed_tokens}")
@@ -46,8 +48,15 @@ class KVAllocWrapper:
         """
         First consume tail slack in allocated blocks, then request from pool if needed
         """
-        slack = self.compute_kv_slack_tokens(request)
-        need_tokens_from_pool = max(0, step_tokens - slack)
+        block_size = self._kv_block_size()
+        num_allocated_blocks = self.kv_pool.get_allocated_block_count(request.request_id)
+        capacity_tokens = num_allocated_blocks * block_size
+        cached_tokens = self.kv_pool.get_cached_token_count(request.request_id)
+        next_total_private_tokens = max(
+            0,
+            request.num_computed_tokens + step_tokens - cached_tokens,
+        )
+        need_tokens_from_pool = max(0, next_total_private_tokens - capacity_tokens)
         # if need_tokens_from_pool > 0:
         #     logger.debug(f"    [ALLOC] req {request.request_id} step_tokens={step_tokens} slack={slack} -> need_from_pool={need_tokens_from_pool}")
         

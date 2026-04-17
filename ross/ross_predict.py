@@ -56,13 +56,6 @@ def _load_backend_modules(backend: str):
 # Thread / process setup
 # ---------------------------------------------------------------------------
 
-_debug_logging = False  # set to True in main() when args.debug is on
-
-def _log(msg: str) -> None:
-    if _debug_logging:
-        print(msg, file=sys.stderr, flush=True)
-
-
 def _task_brief(task: "SimulationTask") -> str:
     return (
         f"task_id={task.task_id} model={Path(task.model).name} parallel={task.parallel} "
@@ -83,10 +76,11 @@ def _set_thread_env(threads_per_worker: int) -> None:
     os.environ["OPENBLAS_NUM_THREADS"] = value
 
 
-def _worker_init(threads_per_worker: int) -> None:
+def _worker_init(threads_per_worker: int, log_file: str, debug: bool) -> None:
     _set_thread_env(threads_per_worker)
     faulthandler.enable(all_threads=True)
-    _log(f"[worker-init] pid={os.getpid()} threads_per_worker={threads_per_worker}")
+    if debug:
+        setup_logging(log_file, debug=True, append=True)
 
 
 def _recommend_parallelism(backend: str, cpu_count: int | None) -> tuple[int, int]:
@@ -132,6 +126,10 @@ class SimulationTask:
     gpu: str
     debug: bool
     fast: bool = False
+    validate_vllm_schedule: bool = False
+    compare_vllm_schedule: bool = False
+    vllm_src_root: str = ""
+    vllm_result_source: str = "sim"
     # optional fields
     dataset: str = ""
     num_prompt: int = 0
@@ -175,12 +173,21 @@ def run_sim_predict(backend: str, model: str, parallel: str,
                     runtime_config: RuntimeConfig,
                     platform_perf_yaml: str,
                     modeling_dir: str,
-                    fast: bool = False):
+                    fast: bool = False,
+                    validate_vllm_schedule: bool = False,
+                    compare_vllm_schedule: bool = False,
+                    vllm_src_root: str = "",
+                    vllm_result_source: str = "sim"):
     """Dispatch to the correct bench module based on backend."""
     is_disagg = "@" in parallel
     extra_kwargs = {}
     if backend in {"vllm", "sglang"}:
         extra_kwargs["fast"] = fast
+    if backend == "vllm":
+        extra_kwargs["validate_vllm_schedule"] = validate_vllm_schedule
+        extra_kwargs["compare_vllm_schedule"] = compare_vllm_schedule
+        extra_kwargs["vllm_src_root"] = vllm_src_root
+        extra_kwargs["vllm_result_source"] = vllm_result_source
     if not is_disagg:
         dp, pp, tp = parallel.split(":")
         summary = _bench_mod.find_best_colocate_result_under_constraints(
@@ -264,7 +271,6 @@ def _build_pareto_row(sim_result_dict: Dict[str, Any], task: "SimulationTask") -
 # ---------------------------------------------------------------------------
 
 def run_single_sim(task: "SimulationTask") -> tuple:
-    _log(f"[task-start] pid={os.getpid()} {_task_brief(task)}")
     try:
         _load_backend_modules(task.backend)
 
@@ -274,11 +280,14 @@ def run_single_sim(task: "SimulationTask") -> tuple:
             task.runtime_config, task.hw_yaml,
             modeling_dir=task.modeling_dir,
             fast=task.fast,
+            validate_vllm_schedule=task.validate_vllm_schedule,
+            compare_vllm_schedule=task.compare_vllm_schedule,
+            vllm_src_root=task.vllm_src_root,
+            vllm_result_source=task.vllm_result_source,
         )
         sim_elapsed_s = time.perf_counter() - sim_start_t
 
         if sim_result_dict is None:
-            _log(f"[task-done] pid={os.getpid()} {_task_brief(task)} sim_elapsed_s={sim_elapsed_s:.3f} result=None")
             return None, sim_elapsed_s, task.parallel, task.model, task.runtime_config.rate
 
         if task.debug:
@@ -291,13 +300,8 @@ def run_single_sim(task: "SimulationTask") -> tuple:
                 if "timing_phases" in sim_result_dict:
                     _debug_phase_dump(task, "timing_phases", sim_result_dict["timing_phases"])
 
-        _log(
-            f"[task-done] pid={os.getpid()} {_task_brief(task)} "
-            f"sim_elapsed_s={sim_elapsed_s:.3f} duration={sim_result_dict.get('duration')}"
-        )
         return sim_result_dict, sim_elapsed_s, task.parallel, task.model, task.runtime_config.rate
     except Exception:
-        _log(f"[task-error] pid={os.getpid()} {_task_brief(task)}\n{traceback.format_exc()}")
         raise
 
 
@@ -524,37 +528,45 @@ def _get_sweep(conf: "BenchmarkConfig", backend: str, gpu: str) -> list[tuple]:
     chunk_list = [8192]
     mbt_list   = [8192]
     cpu_list   = [None]
+    epc_list   = [False]
 
     conf_args = {}
     if conf.args.get(backend):
         conf_args = conf.args[backend][0]
 
+    if "enable_prefix_caching" in conf_args:
+        raw = conf_args["enable_prefix_caching"]
+        raw_list = raw if isinstance(raw, list) else [raw]
+        epc_list = [
+            x if isinstance(x, bool) else str(x).strip().lower() in {"1", "true", "yes", "on"}
+            for x in raw_list
+        ]
+    if "cpu_count" in conf_args:
+        raw = conf_args["cpu_count"]
+        cpu_list = raw if isinstance(raw, list) else [raw]
+
     if backend == "sglang":
         if "mem_fraction_static"  in conf_args: mem_list   = conf_args["mem_fraction_static"]
         if "chunked_prefill_size" in conf_args: chunk_list = conf_args["chunked_prefill_size"]
-        if "cpu_count"            in conf_args:
-            raw = conf_args["cpu_count"]
-            cpu_list = raw if isinstance(raw, list) else [raw]
         # B200 requires larger chunked-prefill window
         if gpu.upper() == "B200":
             chunk_list = [16384]
         return [
-            (chunk, mem, None, cpu)
+            (chunk, mem, None, cpu, epc)
             for chunk in chunk_list
             for mem   in mem_list
             for cpu   in cpu_list
+            for epc   in epc_list
         ]
     else:  # vllm
         if "gpu_memory_utilization" in conf_args: mem_list   = conf_args["gpu_memory_utilization"]
         if "max_num_batched_tokens" in conf_args: mbt_list   = conf_args["max_num_batched_tokens"]
-        if "cpu_count"              in conf_args:
-            raw = conf_args["cpu_count"]
-            cpu_list = raw if isinstance(raw, list) else [raw]
         return [
-            (None, mem, mbt, cpu)
+            (None, mem, mbt, cpu, epc)
             for mem in mem_list
             for mbt in mbt_list
             for cpu in cpu_list
+            for epc in epc_list
         ]
 
 
@@ -566,15 +578,13 @@ def main():
     MACHINE_STATS_PREFIX = "../collector"
     args = parse_predict_args()
 
-    global _debug_logging
-    _debug_logging = args.debug
-
     conf = BenchmarkConfig(args)
     backend = conf.backends[0]
 
     _load_backend_modules(backend)
 
-    setup_logging(f"./log/ross_{backend}_predict.log", args.debug)
+    log_file = f"./log/ross_{backend}_predict.log"
+    setup_logging(log_file, args.debug)
 
     # Override parallel configs for pareto search
     if args.get_pareto_front:
@@ -653,7 +663,8 @@ def main():
                                 )
 
                             # Inner scheduler param loop
-                            for (chunk_size, mem_or_gpu, mbt, cpu_count) in inner_iter:
+                            for sweep_item in inner_iter:
+                                chunk_size, mem_or_gpu, mbt, cpu_count, enable_prefix_caching = sweep_item
                                 hw_yaml = f"{MACHINE_STATS_PREFIX}/{gpu.lower()}/platform_features.yaml"
                                 assert os.path.exists(hw_yaml), f"Missing platform yaml: {hw_yaml}"
 
@@ -662,15 +673,27 @@ def main():
                                     sched_cfg = {
                                         "mem_fraction_static":  mem_or_gpu,
                                         "chunked_prefill_size": chunk_size,
+                                        "enable_prefix_caching": enable_prefix_caching,
                                     }
                                 else:
                                     sched_cfg = {
                                         "gpu_memory_utilization": mem_or_gpu,
                                         "max_num_batched_tokens":  mbt,
                                         "gpu": gpu.lower(),
+                                        "enable_prefix_caching": enable_prefix_caching,
                                     }
                                 if cpu_count is not None:
                                     sched_cfg["cpu_count"] = cpu_count
+                                if (
+                                    backend == "vllm"
+                                    and enable_prefix_caching
+                                    and args.compare_vllm_schedule
+                                ):
+                                    raise ValueError(
+                                        "enable_prefix_caching=true cannot be combined with "
+                                        "--compare-vllm-schedule because vLLM and sim scheduling "
+                                        "are expected to diverge."
+                                    )
                                 runtime_config = RuntimeConfig(
                                     batch_size=batch, isl=isl, osl=osl, rate=rate,
                                     scheduler_config=sched_cfg,
@@ -687,6 +710,21 @@ def main():
                                     gpu=gpu.lower(),
                                     debug=args.debug,
                                     fast=args.fast,
+                                    validate_vllm_schedule=(
+                                        backend == "vllm"
+                                        and bool(args.vllm_src_root)
+                                        and (
+                                            args.compare_vllm_schedule
+                                            or args.vllm_result_source == "vllm"
+                                        )
+                                    ),
+                                    compare_vllm_schedule=(
+                                        backend == "vllm"
+                                        and bool(args.vllm_src_root)
+                                        and args.compare_vllm_schedule
+                                    ),
+                                    vllm_src_root=args.vllm_src_root if backend == "vllm" else "",
+                                    vllm_result_source=args.vllm_result_source if backend == "vllm" else "sim",
                                     dataset=dataset,
                                     num_prompt=conf.num_prompt,
                                     modeling_dir=conf.modeling_dir,
@@ -724,7 +762,7 @@ def main():
                 max_workers=max_workers,
                 mp_context=ctx,
                 initializer=_worker_init,
-                initargs=(threads_per_worker,),
+                initargs=(threads_per_worker, log_file, args.debug),
             ) as executor:
                 task_iter = iter(tasks)
                 future_to_task = {}
@@ -735,7 +773,6 @@ def main():
                             task = next(task_iter)
                         except StopIteration:
                             return
-                        _log(f"[submit] {_task_brief(task)}")
                         future_to_task[executor.submit(run_single_sim, task)] = task
 
                 _submit_until_full()

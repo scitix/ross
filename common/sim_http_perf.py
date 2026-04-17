@@ -58,7 +58,7 @@ class VirtualClientStore(RequestStore):
         self.disaggregation = disaggregation
         self.requests, _ = load_online_requests_w_arrivals(
             frontend_path, dp_size,
-            disaggregation=disaggregation
+            disaggregation=disaggregation,
         )
         self.num_prompts = len(self.requests)
 
@@ -89,7 +89,6 @@ class VirtualClientStore(RequestStore):
         heapq.heappush(self.available_slots, (finish_time, slot_id))
         if self.inflight > 0:
             self.inflight -= 1
-            # print(f"New Finish: rid = {rid}, finish_time = {finish_time}")
         else:
             raise RuntimeError(f"record_finish called when inflight=0 (rid={rid})")
 
@@ -141,7 +140,6 @@ class VirtualClientStore(RequestStore):
                 new_requests.append(new_req)
                 self.next_to_admit_idx += 1
                 self.inflight += 1
-                # print(f"New request: idx = {self.next_to_admit_idx}, rid = {new_req.request_id}, arr_time = {ingress_t}")
             else:
                 break
                 

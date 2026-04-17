@@ -54,6 +54,7 @@ class Scheduler:
         disaggregation_mode: str = None,
         pp: int = 1,
         page_size: int = 1,
+        enable_prefix_caching: bool = False,
     ):
         self.waiting_queue = waiting_queue
         self.policy = SchedulePolicy()        
@@ -66,6 +67,7 @@ class Scheduler:
         # TODO: max_prefill_tokens functions?
         self.chunked_prefill_size = chunked_prefill_size
         self.page_size = max(1, page_size)
+        self.enable_prefix_caching = enable_prefix_caching
         
         self.running_batch = Batch(forward_mode="decode")
         self.running_queue: List[Batch] = []
@@ -77,6 +79,79 @@ class Scheduler:
         self.disaggregation_mode = disaggregation_mode
         self.completed_prefill_reqs: List[Request] = []
         self.pending_decode_queue: List[Request] = []
+
+    def _maybe_match_prefix(self, req: Request) -> None:
+        if not self.enable_prefix_caching or req.prefix_match_checked:
+            return
+        if req.prompt_token_ids is None or req.chunk_offset > 0:
+            req.prefix_match_checked = True
+            return
+
+        matched_tokens = self.kv_allocator.kv_pool.match_prefix(
+            request_id=req.request_id,
+            token_ids=req.prompt_token_ids,
+            extra_key=req.prefix_extra_key,
+            max_prefix_len=req.prompt_tokens,
+        )
+        req.prefix_match_checked = True
+        req.prefix_matched_tokens = matched_tokens
+        if matched_tokens > 0:
+            req.chunk_offset = max(req.chunk_offset, matched_tokens)
+            req.num_computed_tokens = max(req.num_computed_tokens, matched_tokens)
+
+    def _commit_prefix(self, req: Request) -> None:
+        if (
+            not self.enable_prefix_caching
+            or req.prompt_token_ids is None
+            or req.chunk_offset <= req.prefix_committed_tokens
+        ):
+            return
+
+        committed_tokens = self.kv_allocator.kv_pool.commit_prefix(
+            request_id=req.request_id,
+            token_ids=req.prompt_token_ids,
+            computed_tokens=req.chunk_offset,
+            extra_key=req.prefix_extra_key,
+            chunked=req.chunk_offset < req.prompt_tokens,
+        )
+        req.prefix_committed_tokens = max(req.prefix_committed_tokens, committed_tokens)
+
+    def _handle_zero_prefill_completion(self, req: Request, decode_batch: Batch) -> None:
+        if self.disaggregation_mode == "prefill":
+            self.completed_prefill_reqs.append(req)
+            return
+
+        total_reqs = decode_batch.batch_size() + 1
+        headroom = self.reserved_decode_tokens * total_reqs
+        if self.kv_allocator.available_tokens >= headroom:
+            decode_batch.reqs.append(req)
+        else:
+            self.pending_decode_queue.append(req)
+
+    def _promote_prefix_hits(self) -> None:
+        if self.disaggregation_mode == "decode":
+            return
+
+        if self.running_batch.forward_mode != "decode":
+            self.running_batch.forward_mode = "decode"
+
+        kept_chunked = []
+        for req in self.chunked_reqs:
+            self._maybe_match_prefix(req)
+            if req.needs_prefill() or req.finished:
+                kept_chunked.append(req)
+            else:
+                self._handle_zero_prefill_completion(req, self.running_batch)
+        self.chunked_reqs = kept_chunked
+
+        kept_waiting = []
+        for req in self.waiting_queue:
+            self._maybe_match_prefix(req)
+            if req.needs_prefill() or req.finished:
+                kept_waiting.append(req)
+            else:
+                self._handle_zero_prefill_completion(req, self.running_batch)
+        self.waiting_queue = kept_waiting
 
     def _tokens_needed_next_decode(self, requests: List[Request]):
         return len( [r for r in requests if not r.finished] )
@@ -226,6 +301,7 @@ class Scheduler:
             return 0, 0, False
         self.total_prefill_tokens += tokens_to_alloc
         req.commit_chunk(tokens_needed_raw)
+        self._commit_prefix(req)
         return tokens_needed_raw, tokens_to_alloc, True
     
     def get_num_allocatable_reqs(self) -> int:
@@ -257,6 +333,10 @@ class Scheduler:
 
         next_chunked = []
         for req in self.chunked_reqs:
+            self._maybe_match_prefix(req)
+            if not req.needs_prefill():
+                self._handle_zero_prefill_completion(req, self.running_batch)
+                continue
             tokens_raw = req.next_chunk_tokens(chunk_budget)
             tokens_alloc = self._align_to_budget(tokens_raw, chunk_budget)
             tokens_raw, tokens_alloc, ok = self.add_request(
@@ -292,6 +372,11 @@ class Scheduler:
 
         while self.waiting_queue:
             req = self.waiting_queue[0]
+            self._maybe_match_prefix(req)
+            if not req.needs_prefill():
+                self.waiting_queue.pop(0)
+                self._handle_zero_prefill_completion(req, self.running_batch)
+                continue
             total_running = self.running_batch.batch_size() + len(can_run_list)
             if total_running >= self.max_reqs_per_mb:
                 break
@@ -421,6 +506,7 @@ class Scheduler:
         else:
             self.running_batch = Batch(forward_mode="decode")
 
+        self._promote_prefix_hits()
         self._try_admit_pending_decode()
 
         # logger.debug(f"[Scheduler] <disagg_mode={self.disaggregation_mode}> get_next_batch_to_run:\nrunning_batch={self.running_batch},\nself.waiting_queue={[r.request_id for r in self.waiting_queue]}")

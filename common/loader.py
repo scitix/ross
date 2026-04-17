@@ -4,7 +4,7 @@ from typing import List, Tuple, Dict, Any
 import logging
 
 
-def setup_logging(log_file: str, debug: bool = False) -> None:
+def setup_logging(log_file: str, debug: bool = False, append: bool = False) -> None:
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
 
@@ -20,7 +20,7 @@ def setup_logging(log_file: str, debug: bool = False) -> None:
     console_handler.setFormatter(console_fmt)
 
     if debug:
-        file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        file_handler = logging.FileHandler(log_file, mode='a' if append else 'w', encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(file_fmt)
         logger.addHandler(file_handler)
@@ -70,8 +70,9 @@ def load_online_requests_w_arrivals(
                         )
 
                     prompt_tokens  = data['prompt_tokens']
+                    prompt_token_ids = data.get('prompt_token_ids')
                     tokenize_time  = data['tokenize_time']
-                    input_requests.append((ts, req_id, prompt, max_tokens, prompt_tokens, tokenize_time))
+                    input_requests.append((ts, req_id, prompt, max_tokens, prompt_tokens, prompt_token_ids, tokenize_time))
                 except json.JSONDecodeError:
                     print(f"Error: Line {line_number + 1} is not a valid JSON")
 
@@ -82,7 +83,7 @@ def load_online_requests_w_arrivals(
         return requests, prompt_len
     base_ts = input_requests[1][0] if len(input_requests) > 1 else input_requests[0][0]
     prev_arrive_time = 0.0
-    for idx, (ts, req_id, prompt, max_tokens, prompt_tokens, tokenize_time) in enumerate(input_requests):
+    for idx, (ts, req_id, prompt, max_tokens, prompt_tokens, prompt_token_ids, tokenize_time) in enumerate(input_requests):
         arrive_time = max(0, ts - base_ts)
         arrive_time = max(arrive_time, prev_arrive_time)
         prev_arrive_time = arrive_time
@@ -91,6 +92,7 @@ def load_online_requests_w_arrivals(
         req = Request(request_id=req_id,
             prompt=prompt,
             prompt_tokens=prompt_tokens,
+            prompt_token_ids=prompt_token_ids,
             max_new_tokens=max_tokens,
             dp_rank=assigned,
             disaggregation=disaggregation,

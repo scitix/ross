@@ -36,10 +36,14 @@ test/               Unit and integration tests
 ROSS runs on a CPU-only host; no GPU is required for simulation.
 
 ```bash
-pip install xgboost==3.2.0 scikit-learn pandas tqdm plotext
+pip install -r requirements-ross.txt
 ```
 
-Pre-trained regression models for H200 and B200 are loaded at runtime from the directory specified by the `modeling_dir` field in your config file (or via the `--modeling-dir` CLI flag). If you want to target a new GPU, follow the profiling workflow described in the [Advanced Features](#advanced-features) section and point `modeling_dir` at the resulting model directory.
+This installs the Python dependencies used by the simulator and arrival generation.
+
+Pre-trained regression models trained on H200 and B200 profiling data are loaded at runtime from the directory specified by the `modeling_dir` field in your config file (or via the `--modeling-dir` CLI flag). These models have useful transferability to new GPU platforms, but if you want platform-specific calibration, follow the profiling workflow described in the [Advanced Features](#advanced-features) section and point `modeling_dir` at the resulting model directory.
+
+Pre-trained ROSS modeling artifacts are also published at [CharlesCAOO/ross](https://huggingface.co/CharlesCAOO/ross). You can download them from Hugging Face and point `modeling_dir` to the local directory that contains the extracted files.
 
 ### A first prediction
 
@@ -99,6 +103,9 @@ built-in default  <  --config FILE  <  command-line flags
 | `--eval`                  | Load trace logs and compute prediction error         |
 | `--get-pareto-front`      | Enumerate configs and compute Pareto front           |
 | `--debug`                 | Verbose logging                                      |
+| `--vllm-src-root DIR`     | Enable the optional vLLM sidecar scheduler              |
+| `--compare-vllm-schedule` | Compare simulator and vLLM sidecar schedules per step   |
+| `--vllm-result-source`    | Use `sim` or `vllm` timing input for prediction         |
 
 A complete list of CLI flags, JSON config fields, and engine-specific arguments is documented in [`docs/bench_config.md`](docs/bench_config.md).
 
@@ -213,6 +220,27 @@ CLI equivalent:
 --args "sglang@mem_fraction_static=0.9,chunked_prefill_size=8192"
 ```
 
+### vLLM sidecar scheduler
+
+For vLLM, ROSS can run an optional sidecar scheduler. You can use it either to:
+
+- compare each scheduling step against the simulator scheduler
+- or drive timing features from the vLLM sidecar output
+
+- Sidecar enablement requires `--vllm-src-root /path/to/vllm`
+- Step-by-step comparison additionally requires `--compare-vllm-schedule`
+- To use sidecar timing for prediction without strict comparison, set `--vllm-result-source vllm`
+- CLI-only; not read from JSON config
+
+Example:
+
+```bash
+python ross/ross_predict.py \
+  --config my_config.json \
+  --vllm-src-root /path/to/vllm \
+  --vllm-result-source vllm
+```
+
 ### Parallel workers
 
 Large sweeps are parallelized across CPUs via `--max-workers` and `--threads-per-worker`. Both default to auto-selection based on the host's CPU count and scale linearly with available cores.
@@ -236,17 +264,17 @@ ROSS's stage-wise regressor takes **model configuration features** as input rath
 | Family      | Variants                                      |
 | ----------- | --------------------------------------------- |
 | Llama-3.1   | 8B, 70B                                       |
-| Qwen2.5     | 72B-Instruct                                  |
-| Qwen3       | 32B, 30B-A3B (MoE), 235B-A22B (MoE), QwQ 32B  |
+| Qwen2.5     | 72B                                           |
+| Qwen3       | 32B, 30B-A3B (MoE), 235B-A22B (MoE)           |
 | DeepSeek-V3 | 671B (MoE)                                    |
 | gpt-oss     | 20b, 120b                                     |
 
 **Backends:** vLLM, SGLang
 **Deployment modes:** colocated, PD-disaggregated
-**Hardware:** NVIDIA H200, B200 (extensible via the `collector/` workflow)
+**Hardware:** Trained on NVIDIA H200 and B200 profiles, with practical generalization to new GPUs; for best accuracy on a new platform, profile it with the `collector/` workflow.
 **Datasets:** ShareGPT, RepoQA, AIME
 
 Models and platforms outside this list can generally be added by:
 
 1. Placing the HF-format model under your configured `model_search_paths`, and
-2. Profiling the target GPU with the `collector/` scripts if it is not H200/B200.
+2. Profiling the target GPU with the `collector/` scripts if you want platform-specific calibration.

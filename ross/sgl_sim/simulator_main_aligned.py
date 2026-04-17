@@ -23,13 +23,13 @@ from scheduler.scheduler import Scheduler, Batch
 
 from simulator_main import (
     get_ross_models,
-    get_cached_platform_perf,
-    get_cached_worker_config,
     reset_sgl_predict_stats,
     collect_sgl_predict_stats,
     update_metrics,
     calulcate_benchmark_results,
     check_sched_idle,
+    _get_sim_prefix_cache_cls,
+    _load_sim_prefix_cache,
 )
 
 import logging
@@ -59,6 +59,7 @@ def parse_args():
     ap.add_argument("--mem-fraction-static", type=float, default=0.9)
     ap.add_argument("--chunked-prefill-size", type=int, default=8192)
     ap.add_argument("--reserved-decode-tokens", type=int, default=512)
+    ap.add_argument("--enable-prefix-caching", action="store_true", default=False)
 
     # Workload Config
     ap.add_argument("--batch-size", type=int, required=True)
@@ -79,8 +80,6 @@ def parse_args():
     ap.add_argument('--decode_pre_forward_path', type=str, required=True, help='Path to the Saved PRE-FORWARD Model file.')
     ap.add_argument('--decode_forward_path', type=str, required=True, help='Path to the Saved [Decode] FORWARD Model file.')
     ap.add_argument('--decode_post_forward_path', type=str, required=True, help='Path to the Saved [Decode] POST-FORWARD Model file.')
-    ap.add_argument('--cache-worker-config', action='store_true', default=False, help='Cache heavy simulator objects within each worker process.')
-
     return ap.parse_args()
 
 class BaseWorker:
@@ -93,7 +92,10 @@ class BaseWorker:
         mem_fraction_static: float,
         total_gpu_memory: int,
         pp: int = 1,
+        scheduler_kwargs: Dict[str, Any] | None = None,
     ):
+        scheduler_kwargs = scheduler_kwargs or {}
+        self.scheduler_kwargs = scheduler_kwargs
         self.dp_rank = dp_rank
         self.rank_id = rank_id
         self.kv_pool = SGLKVCachePool(
@@ -104,6 +106,10 @@ class BaseWorker:
             total_gpu_memory=total_gpu_memory,
             framework='sglang',
         )
+        if scheduler_kwargs.get("enable_prefix_caching", False):
+            self.kv_pool.enable_prefix_cache(
+                _get_sim_prefix_cache_cls()(page_size=self.kv_pool.page_size)
+            )
         self.pp = pp
         self.request_list = list(request_list)
 
@@ -142,15 +148,25 @@ class PrefillWorker(BaseWorker):
         mem_fraction_static: float,
         total_gpu_memory: int,
         pp: int = 1,
-        scheduler_kwargs: Dict[str, Any] = dict()
+        scheduler_kwargs: Dict[str, Any] = dict(),
     ):
-        super().__init__(dp_rank, rank_id, request_list, model, batch_size, mem_fraction_static, total_gpu_memory)
+        super().__init__(
+            dp_rank,
+            rank_id,
+            request_list,
+            model,
+            batch_size,
+            mem_fraction_static,
+            total_gpu_memory,
+            pp=pp,
+            scheduler_kwargs=scheduler_kwargs,
+        )
         self.scheduler = Scheduler(
             waiting_queue=[],
             disaggregation_mode="prefill",
             kv_pool=self.kv_pool,
             pp=pp,
-            **scheduler_kwargs)
+            **self.scheduler_kwargs)
         self.pending_reqs = deque(request_list)
         self.timing_phases = { "pre_forward": 0, "forward": 0, "post_forward": 0 }
 
@@ -246,15 +262,25 @@ class DecodeWorker(BaseWorker):
         mem_fraction_static: float,
         total_gpu_memory: int,
         pp: int = 1,
-        scheduler_kwargs: Dict[str, Any] = dict()
+        scheduler_kwargs: Dict[str, Any] = dict(),
     ):
-        super().__init__(dp_rank, rank_id, request_list, model, batch_size, mem_fraction_static, total_gpu_memory)
+        super().__init__(
+            dp_rank,
+            rank_id,
+            request_list,
+            model,
+            batch_size,
+            mem_fraction_static,
+            total_gpu_memory,
+            pp=pp,
+            scheduler_kwargs=scheduler_kwargs,
+        )
         self.scheduler = Scheduler(
             waiting_queue=[],
             disaggregation_mode="decode",
             kv_pool=self.kv_pool,
             pp=pp,
-            **scheduler_kwargs)
+            **self.scheduler_kwargs)
         self.timing_phases = { "pre_forward": 0, "forward": 0, "post_forward": 0 }
         self.complete_events = deque()
         self.finished_req_ids = set()
@@ -403,7 +429,7 @@ def run_simulation_disagg_aligned(
             mem_fraction_static=mem_fraction_static,
             total_gpu_memory=total_gpu_memory,
             pp=pp,
-            scheduler_kwargs=scheduler_kwargs
+            scheduler_kwargs=scheduler_kwargs,
         )
         prefill_workers.append(worker)
         enqueue_worker(worker)
@@ -417,7 +443,7 @@ def run_simulation_disagg_aligned(
             mem_fraction_static=mem_fraction_static,
             total_gpu_memory=total_gpu_memory,
             pp=1,
-            scheduler_kwargs=scheduler_kwargs
+            scheduler_kwargs=scheduler_kwargs,
         )
         decode_workers.append(worker)
         enqueue_worker(worker)
@@ -747,13 +773,11 @@ def run_sim(args):
         "chunked_prefill_size": args.chunked_prefill_size,
         "reserved_decode_tokens": args.reserved_decode_tokens,
         "max_running_requests": args.batch_size,
+        "enable_prefix_caching": getattr(args, "enable_prefix_caching", False),
     }
-    use_cache = getattr(args, "cache_worker_config", False)
-    platform_perf = (
-        get_cached_platform_perf(args.platform_perf)
-        if use_cache
-        else PlatformPerf(platform_perf_yaml=args.platform_perf)
-    )
+    if scheduler_kwargs["enable_prefix_caching"]:
+        _load_sim_prefix_cache()
+    platform_perf = PlatformPerf(platform_perf_yaml=args.platform_perf)
 
     def _init_worker_config(tp_size: int, pp_size: int, model_path: Dict[str, str]):
         inference_config = InferenceConfig(tp_size=tp_size, pp_size=pp_size)
@@ -787,32 +811,16 @@ def run_sim(args):
             "decode_forward": args.decode_forward_path,
             "decode_post_forward": args.decode_post_forward_path,
         }
-        if use_cache:
-            prefill_model, prefill_ross_model_dict, _ = get_cached_worker_config(
-                model_uri=args.model_uri,
-                platform_perf_yaml=args.platform_perf,
-                tp_size=args.prefill_tp_size,
-                pp_size=args.prefill_pp_size,
-                model_path=prefill_model_path,
-            )
-            decode_model, decode_ross_model_dict, _ = get_cached_worker_config(
-                model_uri=args.model_uri,
-                platform_perf_yaml=args.platform_perf,
-                tp_size=args.decode_tp_size,
-                pp_size=1,
-                model_path=decode_model_path,
-            )
-        else:
-            prefill_model, prefill_ross_model_dict, _ = _init_worker_config(
-                tp_size=args.prefill_tp_size,
-                pp_size=args.prefill_pp_size,
-                model_path=prefill_model_path,
-            )
-            decode_model, decode_ross_model_dict, _ = _init_worker_config(
-                tp_size=args.decode_tp_size,
-                pp_size=1,
-                model_path=decode_model_path,
-            )
+        prefill_model, prefill_ross_model_dict, _ = _init_worker_config(
+            tp_size=args.prefill_tp_size,
+            pp_size=args.prefill_pp_size,
+            model_path=prefill_model_path,
+        )
+        decode_model, decode_ross_model_dict, _ = _init_worker_config(
+            tp_size=args.decode_tp_size,
+            pp_size=1,
+            model_path=decode_model_path,
+        )
         ross_model_dict = { **prefill_ross_model_dict, **decode_ross_model_dict }
 
         ret = run_simulation_disagg_aligned(
@@ -841,13 +849,8 @@ def run_sim(args):
             "decode_tp": args.decode_tp_size,
         })
     
+    ret.update(scheduler_kwargs)
     ret.update({
         "mem_fraction_static": args.mem_fraction_static,
-        "chunked_prefill_size": args.chunked_prefill_size
     })
     return ret
-
-if __name__ == "__main__":
-    args = parse_args()
-    ret = run_sim(args)
-    print(f"[SIM] result={ret}")

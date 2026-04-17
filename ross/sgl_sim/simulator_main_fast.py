@@ -17,12 +17,12 @@ from scheduler.scheduler import Scheduler, Batch
 
 from simulator_main import (
     parse_args,
-    get_cached_platform_perf,
-    get_cached_worker_config,
     get_ross_models,
     get_model,
     PlatformPerf,
     InferenceConfig,
+    _get_sim_prefix_cache_cls,
+    _load_sim_prefix_cache,
     update_metrics,
     calulcate_benchmark_results,
     check_sched_idle,
@@ -142,6 +142,7 @@ def run_simulation_fast(
     reset_sgl_predict_stats(ross_models)
     schedulers: List[Scheduler] = []
     prefill_phases, decode_phases = [], []
+    enable_prefix_caching = bool(scheduler_kwargs.get("enable_prefix_caching", False))
 
     for _ in range(dp):
         kv_pool = SGLKVCachePool(
@@ -152,6 +153,10 @@ def run_simulation_fast(
             gpu_memory_utilization=mem_fraction_static,
             framework="sglang",
         )
+        if enable_prefix_caching:
+            kv_pool.enable_prefix_cache(
+                _get_sim_prefix_cache_cls()(page_size=kv_pool.page_size)
+            )
         schedulers.append(Scheduler(
             waiting_queue=[],
             kv_pool=kv_pool,
@@ -309,16 +314,14 @@ def run_sim(args):
         "chunked_prefill_size": args.chunked_prefill_size,
         "reserved_decode_tokens": args.reserved_decode_tokens,
         "max_running_requests": args.batch_size,
+        "enable_prefix_caching": getattr(args, "enable_prefix_caching", False),
     }
+    if scheduler_kwargs["enable_prefix_caching"]:
+        _load_sim_prefix_cache()
     if args.model_uri.lower().find("deepseek") != -1:
         scheduler_kwargs.update({"page_size": 64})
 
-    use_cache = getattr(args, "cache_worker_config", False)
-    platform_perf = (
-        get_cached_platform_perf(args.platform_perf)
-        if use_cache
-        else PlatformPerf(platform_perf_yaml=args.platform_perf)
-    )
+    platform_perf = PlatformPerf(platform_perf_yaml=args.platform_perf)
 
     def _init_worker_config(tp_size: int, pp_size: int, model_path: Dict[str, str]):
         inference_config = InferenceConfig(tp_size=tp_size, pp_size=pp_size)
@@ -346,20 +349,11 @@ def run_sim(args):
         "decode_forward": args.decode_forward_path,
         "decode_post_forward": args.decode_post_forward_path,
     }
-    if use_cache:
-        model, ross_model_dict, _ = get_cached_worker_config(
-            model_uri=args.model_uri,
-            platform_perf_yaml=args.platform_perf,
-            tp_size=args.tp_size,
-            pp_size=args.pp_size,
-            model_path=model_path,
-        )
-    else:
-        model, ross_model_dict, _ = _init_worker_config(
-            tp_size=args.tp_size,
-            pp_size=args.pp_size,
-            model_path=model_path,
-        )
+    model, ross_model_dict, _ = _init_worker_config(
+        tp_size=args.tp_size,
+        pp_size=args.pp_size,
+        model_path=model_path,
+    )
 
     ret = run_simulation_fast(
         model=model,
@@ -373,14 +367,8 @@ def run_sim(args):
         pp=args.pp_size,
         post_decode_overhead_ms=0,
     )
+    ret.update(scheduler_kwargs)
     ret.update({
         "mem_fraction_static": args.mem_fraction_static,
-        "chunked_prefill_size": args.chunked_prefill_size,
     })
     return ret
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    ret = run_sim(args)
-    print(f"[SIM] result={ret}")

@@ -75,6 +75,7 @@ class Scheduler:
                 long_prefill_token_threshold: int = 8192,
                 chunked_prefill_enabled: bool = True,                
                 preempt_enabled: bool = True,
+                enable_prefix_caching: bool = False,
         ):
         self.max_running_reqs = max_running_reqs
         self.max_model_len = max_model_len
@@ -349,7 +350,6 @@ class Scheduler:
             # p->d case: first decode will allocate kv_len=prompt_len
             if req.transfer_loaded:
                 decode_seq_lens.append(1)
-                # print(f"req to load transfered kv: {req}")
             elif num_scheduled_tokens <= 1:
                 decode_seq_lens.append(int(total_seq_len))
             else:
@@ -400,7 +400,6 @@ class Scheduler:
                 all_tokens = target.output_len + target.prompt_tokens
                 if num_computed_tokens[target.request_id] >= all_tokens:
                     target.output_len += 1
-                    # print(f"   -- {target.request_id}.output_len: {target.output_len} -> + 1")
                 # Check if completed
                 if all_tokens >= target.num_tokens - 1 or all_tokens >= self.max_model_len - 1:
                     target.status = RequestStatus.FINISHED

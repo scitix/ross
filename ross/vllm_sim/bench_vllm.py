@@ -70,6 +70,10 @@ def find_best_colocate_result_under_constraints(
         modeling_dir: str,
         platform_perf_yaml: str | None = None,
         fast: bool = False,
+        validate_vllm_schedule: bool = False,
+        compare_vllm_schedule: bool = False,
+        vllm_src_root: str = "",
+        vllm_result_source: str = "sim",
         top_k: int = 1,
 ) -> InferenceSummary:
     results_df = pd.DataFrame(columns=SummaryColumns)
@@ -99,9 +103,14 @@ def find_best_colocate_result_under_constraints(
 
         "max_num_batched_tokens": runtime_config.scheduler_config["max_num_batched_tokens"],
         "gpu_memory_utilization": runtime_config.scheduler_config["gpu_memory_utilization"],
+        "enable_prefix_caching": runtime_config.scheduler_config.get("enable_prefix_caching", False),
 
         "disaggregation": False,
         "fast": fast,
+        "validate_vllm_schedule": validate_vllm_schedule,
+        "compare_vllm_schedule": compare_vllm_schedule,
+        "vllm_src_root": vllm_src_root,
+        "vllm_result_source": vllm_result_source,
         "debug": False,
     })
 
@@ -129,6 +138,10 @@ def find_best_disagg_result_under_constraints(
         modeling_dir: str,
         platform_perf_yaml: str | None = None,
         fast: bool = False,
+        validate_vllm_schedule: bool = False,
+        compare_vllm_schedule: bool = False,
+        vllm_src_root: str = "",
+        vllm_result_source: str = "sim",
         top_k: int = 1,
 ) -> InferenceSummary:
     results_df = pd.DataFrame(columns=SummaryColumns)
@@ -158,9 +171,14 @@ def find_best_disagg_result_under_constraints(
 
         "max_num_batched_tokens": runtime_config.scheduler_config["max_num_batched_tokens"],
         "gpu_memory_utilization": runtime_config.scheduler_config["gpu_memory_utilization"],
+        "enable_prefix_caching": runtime_config.scheduler_config.get("enable_prefix_caching", False),
 
         "disaggregation": True,
         "fast": fast,
+        "validate_vllm_schedule": validate_vllm_schedule,
+        "compare_vllm_schedule": compare_vllm_schedule,
+        "vllm_src_root": vllm_src_root,
+        "vllm_result_source": vllm_result_source,
         "debug": False,
     })
     

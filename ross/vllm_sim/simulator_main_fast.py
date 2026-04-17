@@ -332,11 +332,6 @@ def run_sim(args):
         isl=args.max_prompt_len,
         osl=args.max_output_len,
     )
+    ret.update(scheduler_kwargs)
     ret.update({"gpu_memory_utilization": gpu_memory_utilization})
     return ret
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    ret = run_sim(args)
-    print(f"[SIM-FAST] result={ret}")

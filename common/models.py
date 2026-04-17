@@ -155,14 +155,10 @@ class BaseModel(object):
             ],
         )
         self.model_uri = model_configs["model_uri"]
-        # print("new features: ", self.model_uri, self._num_experts, self._topk, self._moe_inter_size, self._shared_expert_inter_size)
-        
         if model_configs["model_uri"].lower().find("deepseek") != -1:
             # DeepSeek
             self.kv_lora_rank = model_configs["kv_lora_rank"]
             self.qk_rope_head_dim = model_configs["qk_rope_head_dim"]
-
-        # TODO: remaining configs from ai-configurator
         self.context_ops = []
         self.generation_ops = []
         self._nextn = inference_config.nextn

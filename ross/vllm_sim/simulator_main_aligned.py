@@ -7,9 +7,13 @@ from collections import deque
 from pathlib import Path
 from queue import PriorityQueue
 from typing import Any, Dict, List
+import itertools
 
 TEST_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TEST_ROOT))
+TEST_SIM_ROOT = TEST_ROOT / "test" / "simulator-vllm"
+if str(TEST_SIM_ROOT) not in sys.path:
+    sys.path.insert(0, str(TEST_SIM_ROOT))
 
 from common.config import InferenceConfig
 from common.features import PlatformPerf
@@ -17,6 +21,17 @@ from common.kvpool import KVCachePool
 from common.models import get_model
 from common.ross_model import ROSSModel
 from common.sim_http_perf import VirtualClientStore
+from dummy_sched import (
+    create_pd_decode_request,
+    create_request as create_dummy_request,
+    create_sidecar_scheduler,
+    make_dummy_model_output,
+)
+from sidecar_hook import (
+    choose_timing_output,
+    compare_schedule_outputs,
+    log_sidecar_schedule,
+)
 
 from scheduler.request import Request, RequestStatus
 from scheduler.scheduler import Scheduler, SchedulerOutput
@@ -55,14 +70,23 @@ class BaseWorker:
         rank_id: int,
         scheduler: Scheduler,
         pp: int,
+        sidecar_scheduler: Any = None,
+        vllm_src_root: str = "",
+        vllm_result_source: str = "sim",
+        compare_vllm_schedule: bool = False,
     ):
         self.worker_type = worker_type
         self.rank_id = rank_id
         self.scheduler = scheduler
         self.pp = pp
+        self.sidecar_scheduler = sidecar_scheduler
+        self.vllm_src_root = vllm_src_root
+        self.vllm_result_source = vllm_result_source
+        self.compare_vllm_schedule = compare_vllm_schedule
         self.wall_time = 0.0
         self.step = 0
         self.batch_pipeline: List[SchedulerOutput | None] = []
+        self.sidecar_batch_pipeline: List[Any] = []
         self.complete = False
         self.queued = False
 
@@ -80,8 +104,8 @@ class BaseWorker:
 
 
 class PrefillWorker(BaseWorker):
-    def __init__(self, rank_id: int, scheduler: Scheduler, pp: int):
-        super().__init__("prefill", rank_id, scheduler, pp)
+    def __init__(self, rank_id: int, scheduler: Scheduler, pp: int, sidecar_scheduler: Any = None, vllm_src_root: str = "", vllm_result_source: str = "sim", compare_vllm_schedule: bool = False):
+        super().__init__("prefill", rank_id, scheduler, pp, sidecar_scheduler=sidecar_scheduler, vllm_src_root=vllm_src_root, vllm_result_source=vllm_result_source, compare_vllm_schedule=compare_vllm_schedule)
         self.pending_reqs = deque()
         self.active_reqs: Dict[str, Request] = {}
         self.decode_assign_idx = 0
@@ -103,6 +127,16 @@ class PrefillWorker(BaseWorker):
             req = self.pending_reqs.popleft()
             self.scheduler.add_request(req)
             self.active_reqs[req.request_id] = req
+            if self.sidecar_scheduler is not None:
+                self.sidecar_scheduler.add_request(
+                    create_dummy_request(
+                        request_id=req.request_id,
+                        prompt_token_len=req.prompt_tokens,
+                        max_output_tokens=req.num_tokens - req.prompt_tokens,
+                        block_size=self.scheduler.kv_cache_manager.tokens_per_block,
+                        vllm_src_root=self.vllm_src_root,
+                    )
+                )
         if (
             not self.complete
             and check_pipeline_clear(self.batch_pipeline, self.step, self.pp)
@@ -113,6 +147,16 @@ class PrefillWorker(BaseWorker):
                 self.wall_time = max(self.wall_time, req.ready_time)
                 self.scheduler.add_request(req)
                 self.active_reqs[req.request_id] = req
+                if self.sidecar_scheduler is not None:
+                    self.sidecar_scheduler.add_request(
+                        create_dummy_request(
+                            request_id=req.request_id,
+                            prompt_token_len=req.prompt_tokens,
+                            max_output_tokens=req.num_tokens - req.prompt_tokens,
+                            block_size=self.scheduler.kv_cache_manager.tokens_per_block,
+                            vllm_src_root=self.vllm_src_root,
+                        )
+                    )
             else:
                 self.complete = True
 
@@ -120,14 +164,35 @@ class PrefillWorker(BaseWorker):
         self.step += 1
         schedule_output = self.scheduler.schedule()
         self.batch_pipeline.append(schedule_output)
+        sidecar_output = None
+        timing_output = schedule_output
+        if self.sidecar_scheduler is not None:
+            sidecar_output = self.sidecar_scheduler.schedule()
+            log_sidecar_schedule(self.step, self.rank_id, sidecar_output, phase="prefill")
+            if self.compare_vllm_schedule:
+                compare_schedule_outputs(
+                    self.step,
+                    self.rank_id,
+                    schedule_output,
+                    sidecar_output,
+                    ross_scheduler=self.scheduler,
+                    sidecar_scheduler=self.sidecar_scheduler,
+                )
+            timing_output = choose_timing_output(
+                schedule_output,
+                sidecar_output,
+                self.vllm_result_source,
+                align_transfer_loaded_to_sim=False,
+            )
+            self.sidecar_batch_pipeline.append(sidecar_output)
         if schedule_output and (not self.scheduler.should_terminate()):
             self.scheduler.debug_print_schedule(schedule_output, self.rank_id, self.step)
             for name in ["pre_forward", "forward", "post_forward"]:
                 regression_model = get_regression_model(ross_models, name, "prefill")
                 _time_step = regression_model.predict(
-                    req_ids=schedule_output.scheduled_req_ids,
-                    prefill_seq_lens=schedule_output.prefill_seq_lens,
-                    decode_seq_lens=schedule_output.decode_seq_lens,
+                    req_ids=timing_output.scheduled_req_ids,
+                    prefill_seq_lens=timing_output.prefill_seq_lens,
+                    decode_seq_lens=timing_output.decode_seq_lens,
                     isl=isl,
                     osl=osl,
                 )
@@ -143,6 +208,11 @@ class PrefillWorker(BaseWorker):
         if self.step < self.pp or self.complete:
             return []
         current_output = self.batch_pipeline[self.step - self.pp]
+        if self.sidecar_scheduler is not None:
+            current_sidecar_output = self.sidecar_batch_pipeline[self.step - self.pp]
+            if current_sidecar_output is not None and current_sidecar_output.total_num_scheduled_tokens > 0:
+                dummy_output = make_dummy_model_output(self.sidecar_scheduler, current_sidecar_output)
+                self.sidecar_scheduler.update_from_output(current_sidecar_output, dummy_output)
         self.scheduler.update_from_output(current_output)
         completed = []
         for rid, req in list(self.active_reqs.items()):
@@ -150,6 +220,13 @@ class PrefillWorker(BaseWorker):
                 req.prefill_end_time = self.wall_time
                 req.status = RequestStatus.FINISHED
                 self.scheduler.kv_cache_manager.free(req.request_id)
+                if self.sidecar_scheduler is not None:
+                    sidecar_req = self.sidecar_scheduler.requests.get(req.request_id)
+                    if sidecar_req is not None:
+                        self.sidecar_scheduler.finish_requests(
+                            req.request_id,
+                            type(sidecar_req.status).FINISHED_STOPPED,
+                        )
                 completed.append(req)
                 self.active_reqs.pop(rid, None)
         self.scheduler.running = [req for req in self.scheduler.running if req.status != RequestStatus.FINISHED]
@@ -157,8 +234,8 @@ class PrefillWorker(BaseWorker):
 
 
 class DecodeWorker(BaseWorker):
-    def __init__(self, rank_id: int, scheduler: Scheduler, pp: int):
-        super().__init__("decode", rank_id, scheduler, pp)
+    def __init__(self, rank_id: int, scheduler: Scheduler, pp: int, sidecar_scheduler: Any = None, vllm_src_root: str = "", vllm_result_source: str = "sim", compare_vllm_schedule: bool = False):
+        super().__init__("decode", rank_id, scheduler, pp, sidecar_scheduler=sidecar_scheduler, vllm_src_root=vllm_src_root, vllm_result_source=vllm_result_source, compare_vllm_schedule=compare_vllm_schedule)
         self.pending_reqs = deque()
         self.active_reqs: Dict[str, Request] = {}
         self.timing_phases = {"pre_forward": 0, "forward": 0, "post_forward": 0}
@@ -196,16 +273,62 @@ class DecodeWorker(BaseWorker):
 
     def forward(self, ross_models: Dict[str, Any], isl: int, osl: int) -> None:
         self.step += 1
+        transfer_loaded_waiting = {
+            req.request_id: req
+            for req in self.scheduler.waiting
+            if getattr(req, "transfer_loaded", False)
+        }
         schedule_output = self.scheduler.schedule()
+        timing_output = schedule_output
+        if self.sidecar_scheduler is not None:
+            if schedule_output is not None:
+                for req in itertools.chain(
+                    schedule_output.new_reqs or [],
+                    schedule_output.resumed_reqs or [],
+                    schedule_output.running_reqs or [],
+                ):
+                    if (
+                        req.request_id in transfer_loaded_waiting
+                        and req.request_id not in self.sidecar_scheduler.requests
+                    ):
+                        original_req = transfer_loaded_waiting[req.request_id]
+                        self.sidecar_scheduler.add_request(
+                            create_pd_decode_request(
+                                request_id=original_req.request_id,
+                                prompt_token_len=original_req.prompt_tokens,
+                                max_output_tokens=original_req.num_tokens - original_req.prompt_tokens,
+                                block_size=self.scheduler.kv_cache_manager.tokens_per_block,
+                                vllm_src_root=self.vllm_src_root,
+                            )
+                        )
+            sidecar_output = self.sidecar_scheduler.schedule()
+            log_sidecar_schedule(self.step, self.rank_id, sidecar_output, phase="decode")
+            if self.compare_vllm_schedule:
+                compare_schedule_outputs(
+                    self.step,
+                    self.rank_id,
+                    schedule_output,
+                    sidecar_output,
+                    ross_scheduler=self.scheduler,
+                    sidecar_scheduler=self.sidecar_scheduler,
+                    treat_transfer_loaded_as_decode_one=True,
+                )
+            timing_output = choose_timing_output(
+                schedule_output,
+                sidecar_output,
+                self.vllm_result_source,
+                align_transfer_loaded_to_sim=True,
+            )
+            self.sidecar_batch_pipeline.append(sidecar_output)
         self.batch_pipeline.append(schedule_output)
         if schedule_output and (not self.scheduler.should_terminate()):
             self.scheduler.debug_print_schedule(schedule_output, self.rank_id, self.step)
             for name in ["pre_forward", "forward", "post_forward"]:
                 regression_model = get_regression_model(ross_models, name, "decode")
                 _time_step = regression_model.predict(
-                    req_ids=schedule_output.scheduled_req_ids,
-                    prefill_seq_lens=schedule_output.prefill_seq_lens,
-                    decode_seq_lens=schedule_output.decode_seq_lens,
+                    req_ids=timing_output.scheduled_req_ids,
+                    prefill_seq_lens=timing_output.prefill_seq_lens,
+                    decode_seq_lens=timing_output.decode_seq_lens,
                     isl=isl,
                     osl=osl,
                 )
@@ -221,6 +344,11 @@ class DecodeWorker(BaseWorker):
         if self.step < self.pp or self.complete:
             return []
         current_output = self.batch_pipeline[self.step - self.pp]
+        if self.sidecar_scheduler is not None:
+            current_sidecar_output = self.sidecar_batch_pipeline[self.step - self.pp]
+            if current_sidecar_output is not None and current_sidecar_output.total_num_scheduled_tokens > 0:
+                dummy_output = make_dummy_model_output(self.sidecar_scheduler, current_sidecar_output)
+                self.sidecar_scheduler.update_from_output(current_sidecar_output, dummy_output)
         self.scheduler.update_from_output(current_output)
         self.scheduler.running = [req for req in self.scheduler.running if req.status != RequestStatus.FINISHED]
         finished = []
@@ -247,7 +375,14 @@ def run_simulation_disagg_aligned(
     total_gpu_memory: int | None = None,
     dp: int = 1,
     pp: int = 1,
+    validate_vllm_schedule: bool = False,
+    compare_vllm_schedule: bool = False,
+    vllm_src_root: str = "",
+    vllm_result_source: str = "sim",
 ) -> Dict[str, Any]:
+    if not validate_vllm_schedule and vllm_result_source != "sim":
+        raise ValueError("vllm_result_source='vllm' requires validate_vllm_schedule to be enabled")
+
     workers_pq = PriorityQueue()
     prefill_workers: List[PrefillWorker] = []
     decode_workers: List[DecodeWorker] = []
@@ -271,7 +406,18 @@ def run_simulation_disagg_aligned(
             ),
             **scheduler_kwargs,
         )
-        worker = PrefillWorker(idx, prefill_scheduler, pp)
+        prefill_sidecar = None
+        if validate_vllm_schedule:
+            prefill_sidecar = create_sidecar_scheduler(
+                scheduler_kwargs=scheduler_kwargs,
+                num_blocks=prefill_scheduler.kv_cache_manager.num_blocks,
+                block_size=tokens_per_block,
+                max_num_seqs=batch_size,
+                max_model_len=prefill_scheduler.max_model_len,
+                model_uri=prefill_model.model_uri,
+                vllm_src_root=vllm_src_root,
+            )
+        worker = PrefillWorker(idx, prefill_scheduler, pp, sidecar_scheduler=prefill_sidecar, vllm_src_root=vllm_src_root, vllm_result_source=vllm_result_source, compare_vllm_schedule=compare_vllm_schedule)
         prefill_workers.append(worker)
         enqueue_worker(worker)
 
@@ -288,7 +434,18 @@ def run_simulation_disagg_aligned(
             ),
             **scheduler_kwargs,
         )
-        worker = DecodeWorker(idx, decode_scheduler, 1)
+        decode_sidecar = None
+        if validate_vllm_schedule:
+            decode_sidecar = create_sidecar_scheduler(
+                scheduler_kwargs=scheduler_kwargs,
+                num_blocks=decode_scheduler.kv_cache_manager.num_blocks,
+                block_size=tokens_per_block,
+                max_num_seqs=batch_size,
+                max_model_len=decode_scheduler.max_model_len,
+                model_uri=decode_model.model_uri,
+                vllm_src_root=vllm_src_root,
+            )
+        worker = DecodeWorker(idx, decode_scheduler, 1, sidecar_scheduler=decode_sidecar, vllm_src_root=vllm_src_root, vllm_result_source=vllm_result_source, compare_vllm_schedule=compare_vllm_schedule)
         decode_workers.append(worker)
         enqueue_worker(worker)
 
@@ -413,6 +570,7 @@ def run_sim(args):
     gpu_memory_utilization = _get_gpu_memory_utilization(args)
     scheduler_kwargs = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "enable_prefix_caching": getattr(args, "enable_prefix_caching", False),
     }
     platform_perf = PlatformPerf(platform_perf_yaml=args.platform_perf)
 
@@ -459,14 +617,13 @@ def run_sim(args):
         total_gpu_memory=platform_perf.theoretical_memory_gb * (1024 ** 3),
         dp=args.dp_size,
         pp=1,
+        validate_vllm_schedule=getattr(args, "validate_vllm_schedule", False),
+        compare_vllm_schedule=getattr(args, "compare_vllm_schedule", False),
+        vllm_src_root=getattr(args, "vllm_src_root", ""),
+        vllm_result_source=getattr(args, "vllm_result_source", "sim"),
     )
+    ret.update(scheduler_kwargs)
     ret.update({
         "gpu_memory_utilization": gpu_memory_utilization,
     })
     return ret
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    ret = run_sim(args)
-    print(f"[SIM] result={ret}")

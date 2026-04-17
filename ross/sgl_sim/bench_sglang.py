@@ -45,7 +45,6 @@ def bench_online(
         from simulator_main import run_sim
         
     args = argparse.Namespace(**config_dict)
-    # print(args)
     result_dict = run_sim(args)
 
     result_dict.update({
@@ -70,7 +69,6 @@ def find_best_colocate_result_under_constraints(
         platform_perf_yaml: str | None = None,
         fast: bool = False,
         top_k: int = 1,
-        cache_worker_config: bool = False,
 ) -> InferenceSummary:
     results_df = pd.DataFrame(columns=SummaryColumns)
 
@@ -94,11 +92,11 @@ def find_best_colocate_result_under_constraints(
 
         "chunked_prefill_size": runtime_config.scheduler_config["chunked_prefill_size"],
         "mem_fraction_static": runtime_config.scheduler_config["mem_fraction_static"],
+        "enable_prefix_caching": runtime_config.scheduler_config.get("enable_prefix_caching", False),
         "reserved_decode_tokens": 512,
 
         "disaggregation": False,
         "fast": fast,
-        "cache_worker_config": cache_worker_config,
     })
 
     try:
@@ -127,7 +125,6 @@ def find_best_disagg_result_under_constraints(
         platform_perf_yaml: str | None = None,
         fast: bool = False,
         top_k: int = 1,
-        cache_worker_config: bool = False,
 ) -> InferenceSummary:
     results_df = pd.DataFrame(columns=SummaryColumns)
     results_dict_list = []
@@ -156,11 +153,11 @@ def find_best_disagg_result_under_constraints(
 
         "chunked_prefill_size": runtime_config.scheduler_config["chunked_prefill_size"],
         "mem_fraction_static": runtime_config.scheduler_config["mem_fraction_static"],
+        "enable_prefix_caching": runtime_config.scheduler_config.get("enable_prefix_caching", False),
         "reserved_decode_tokens": 512,
 
         "disaggregation": True,
         "tokenize_url": "http://127.0.0.1:8001/tokenize",
-        "cache_worker_config": cache_worker_config,
     })
     
     try:

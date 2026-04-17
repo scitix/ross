@@ -556,6 +556,7 @@ SHARED OPTIONS  (see docs/bench_config.md for full reference)
   --args STRING            Backend scheduler arguments.
                            SGLang: --args "sglang@mem_fraction_static=0.9,chunked_prefill_size=8192"
                            vLLM:   --args "vllm@gpu_memory_utilization=0.9,max_num_batched_tokens=8192"
+                           vLLM+:  --args "vllm@gpu_memory_utilization=0.9,max_num_batched_tokens=8192,enable_prefix_caching=true"
 
 ────────────────────────────────────────────────────────────────────────────
 PREDICT-ONLY OPTIONS
@@ -563,6 +564,13 @@ PREDICT-ONLY OPTIONS
 
   --debug                  Enable verbose/DEBUG-level logging.
   --fast                   Use the fast vLLM simulator entry when available.
+  --vllm-src-root DIR      Optional vLLM source tree for scheduler validation.
+                           Enables the vLLM sidecar when needed.
+  --compare-vllm-schedule  When vLLM sidecar is enabled, compare simulator and
+                           vLLM scheduling outputs step by step.
+  --vllm-result-source     When vLLM scheduler validation is active, choose
+                           whether predict uses sim or vLLM schedule output
+                           for timing features. Choices: sim, vllm.
   --record-path FILE       Write per-configuration PE metrics to a CSV file.
   --eval                   Load real trace logs and compare against simulator results.
 
@@ -606,6 +614,12 @@ def build_predict_parser():
                         help="Enable verbose/DEBUG-level logging.")
     parser.add_argument("--fast", action="store_true", default=False,
                         help="Use the fast vLLM simulator entry when available.")
+    parser.add_argument("--vllm-src-root", type=str, default="",
+                        help="Optional vLLM source tree for the vLLM sidecar scheduler. CLI-only; not read from config.")
+    parser.add_argument("--compare-vllm-schedule", action="store_true", default=False,
+                        help="When the vLLM sidecar is enabled, compare simulator and vLLM scheduling outputs step by step. CLI-only; not read from config.")
+    parser.add_argument("--vllm-result-source", type=str, default="sim", choices=["sim", "vllm"],
+                        help="When the vLLM sidecar is enabled, choose whether timing features come from the simulator output or the vLLM sidecar output. CLI-only; not read from config.")
     parser.add_argument("--record-path", type=str, default="", metavar="FILE",
                         help="Write per-configuration PE metrics to a CSV file.")
     parser.add_argument("--eval", action="store_true", default=False,
@@ -616,9 +630,6 @@ def build_predict_parser():
                         help="CPU threads per worker process. 0=auto.")
     parser.add_argument("--get-pareto-front", action="store_true",
                         help="Enumerate parallel configs and compute Pareto front.")
-    parser.add_argument("--cache-worker-config", action="store_true",
-                        help="Cache heavy simulator objects within each worker (SGL only).")
-
     return parser
 
 

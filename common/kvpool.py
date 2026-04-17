@@ -1,8 +1,12 @@
 # import torch
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Sequence
 from collections import deque
 
 from common.models import BaseModel
+try:
+    from common.prefix_cache import SimPrefixCache
+except Exception:  # optional dependency for prefix-cache simulation only
+    SimPrefixCache = None  # type: ignore[assignment]
 
 import logging
 logger = logging.getLogger(__name__)
@@ -39,6 +43,60 @@ class KVCachePool:
         # Use a deque as a stack for efficient retrieval and return of free block IDs
         self.free_blocks = deque(range(self.num_blocks))
         self.request_to_blocks: Dict[str, List[int]] = {}
+        self.prefix_cache: Optional[SimPrefixCache] = None
+        self.request_to_cached_tokens: Dict[str, int] = {}
+
+    def enable_prefix_cache(self, prefix_cache: Optional[SimPrefixCache]) -> None:
+        self.prefix_cache = prefix_cache
+
+    def get_cached_token_count(self, request_id: str) -> int:
+        return self.request_to_cached_tokens.get(request_id, 0)
+
+    def set_cached_token_count(self, request_id: str, cached_tokens: int) -> None:
+        self.request_to_cached_tokens[request_id] = max(0, cached_tokens)
+
+    def match_prefix(
+        self,
+        request_id: str,
+        token_ids: Sequence[int],
+        extra_key: Optional[str] = None,
+        max_prefix_len: Optional[int] = None,
+    ) -> int:
+        if self.prefix_cache is None:
+            self.set_cached_token_count(request_id, 0)
+            return 0
+        lease = self.prefix_cache.acquire_request(
+            request_id=request_id,
+            token_ids=token_ids,
+            extra_key=extra_key,
+            max_prefix_len=max_prefix_len,
+        )
+        cached_tokens = max(lease.matched_tokens, lease.committed_tokens)
+        self.set_cached_token_count(request_id, cached_tokens)
+        return cached_tokens
+
+    def commit_prefix(
+        self,
+        request_id: str,
+        token_ids: Sequence[int],
+        computed_tokens: int,
+        extra_key: Optional[str] = None,
+        priority: int = 0,
+        chunked: bool = False,
+    ) -> int:
+        if self.prefix_cache is None:
+            return self.get_cached_token_count(request_id)
+        lease = self.prefix_cache.commit_request(
+            request_id=request_id,
+            token_ids=token_ids,
+            computed_tokens=computed_tokens,
+            extra_key=extra_key,
+            priority=priority,
+            chunked=chunked,
+        )
+        cached_tokens = max(lease.matched_tokens, lease.committed_tokens)
+        self.set_cached_token_count(request_id, cached_tokens)
+        return cached_tokens
     
     def get_allocated_blocks(self, request_id: str) -> List[int]:
         if request_id not in self.request_to_blocks:
@@ -95,6 +153,9 @@ class KVCachePool:
         if request_id in self.request_to_blocks:
             blocks_to_return = self.request_to_blocks.pop(request_id)
             self.free_blocks.extend(blocks_to_return)
+        self.request_to_cached_tokens.pop(request_id, None)
+        if self.prefix_cache is not None:
+            self.prefix_cache.release_request(request_id)
 
     def __repr__(self) -> str:
         return (f"KVCachePool(free={self.num_free_blocks}/{self.num_blocks}, "
@@ -328,6 +389,9 @@ class SGLKVCachePool(KVCachePool):
         if request_id in self._req_alloc_counts:
             count = self._req_alloc_counts.pop(request_id)
             self._free_block_cnt += count
+        self.request_to_cached_tokens.pop(request_id, None)
+        if self.prefix_cache is not None:
+            self.prefix_cache.release_request(request_id)
 
             
     def __repr__(self) -> str:

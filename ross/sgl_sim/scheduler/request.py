@@ -1,17 +1,17 @@
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, Union, Tuple
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from typing import List, Optional, Dict, Any, Tuple
 
 class Request:
     def __init__(self,
                 request_id: str,
                 max_new_tokens: int,
                 prompt_tokens: int = 0,
+                prompt_token_ids: Optional[List[int]] = None,
                 prompt: str = '',
                 disaggregation: bool = False,
                 dp_rank: Tuple[int, int] = None,
                 arrive_time: float = 0,
-                tokenizer: Union[AutoTokenizer, PreTrainedTokenizer] = None):
+                ):
         
         self.request_id = request_id
         if dp_rank is not None:
@@ -24,6 +24,7 @@ class Request:
         self.max_new_tokens = max_new_tokens
         self.prompt = prompt
         self.prompt_tokens = prompt_tokens
+        self.prompt_token_ids = prompt_token_ids
 
         # arrivals
         self.arrive_time = arrive_time
@@ -37,6 +38,10 @@ class Request:
 
         self.start_decode: bool = False
         self.num_computed_tokens: int = 0
+        self.prefix_match_checked: bool = False
+        self.prefix_matched_tokens: int = 0
+        self.prefix_committed_tokens: int = 0
+        self.prefix_extra_key: Optional[str] = None
         
         # metrics
         self.finished: bool = False

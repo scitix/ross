@@ -38,7 +38,7 @@ bootstrap_remote_count: int = 0
 TOKENIZER = None
 
 
-def _tokenize_remote(text: str) -> tuple[int, float]:
+def _tokenize_remote(text: str) -> list[int]:
     payload = json.dumps({"text": text}).encode("utf-8")
     http_req = urllib.request.Request(
         tokenize_url,
@@ -48,15 +48,14 @@ def _tokenize_remote(text: str) -> tuple[int, float]:
     )
     with urllib.request.urlopen(http_req) as response:
         data = json.loads(response.read().decode("utf-8"))
-    return len(data["token_ids"])
+    return data["token_ids"]
 
 
-def _tokenize_local(text: str) -> tuple[int, float]:
-    token_ids = TOKENIZER.encode(text)
-    return len(token_ids)
+def _tokenize_local(text: str) -> list[int]:
+    return TOKENIZER.encode(text)
 
 
-def _resolve_tokenization(rid: int, text: str) -> int:
+def _resolve_tokenization(rid: int, text: str) -> list[int]:
     return _tokenize_local(text)
 
 def call_bench_serving(model, framework, dataset_name, dataset, isl, osl, rate, num_prompt, req_output, batch_size, random_range_ratio=0.0):
@@ -125,14 +124,15 @@ async def _handle_request(request: Request, stream_fn) -> StreamingResponse:
     rid = next(req_counter)
     arrival_ts = time.perf_counter()    
     text = body.get('prompt') or body.get('text') or ''
-    prompt_tokens = await asyncio.to_thread(_resolve_tokenization, rid, str(text))
+    prompt_token_ids = await asyncio.to_thread(_resolve_tokenization, rid, str(text))
     elapsed = time.perf_counter() - arrival_ts
     entry = {
         'ts': arrival_ts,
         'path': str(request.url.path),
         'req_id': rid,
         'body': body,
-        'prompt_tokens': prompt_tokens,
+        'prompt_tokens': len(prompt_token_ids),
+        'prompt_token_ids': prompt_token_ids,
         'tokenize_time': elapsed,
     }
     _append_log(entry)

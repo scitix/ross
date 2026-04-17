@@ -14,6 +14,9 @@ from typing import List, Tuple, Dict, Any
 
 TEST_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TEST_ROOT))
+TEST_SIM_ROOT = TEST_ROOT / "test" / "simulator-vllm"
+if str(TEST_SIM_ROOT) not in sys.path:
+    sys.path.insert(0, str(TEST_SIM_ROOT))
 
 from common.features import PlatformPerf
 from common.models import get_model, BaseModel
@@ -21,13 +24,18 @@ from common.config import InferenceConfig
 from common.kvpool import KVCachePool
 from common.ross_model import ROSSModel
 from common.sim_http_perf import RequestStore, VirtualClientStore
+from dummy_sched import create_sidecar_scheduler, create_request as create_dummy_request, make_dummy_model_output
+from sidecar_hook import (
+    choose_timing_output,
+    compare_schedule_outputs,
+    log_sidecar_schedule,
+)
 
 from scheduler.request import Request, RequestStatus
 from scheduler.scheduler import Scheduler, SchedulerOutput
 
 import logging
 logger = logging.getLogger(__name__)
-
 
 def _warn_pp_pre_forward_disabled(args) -> None:
     has_explicit_deprecated_path = bool(getattr(args, "_explicit_pp_pre_forward_path", False))
@@ -69,6 +77,8 @@ def parse_args():
     # Scheduler Config
     ap.add_argument('--gpu-model-utilization', type=float, required=True, help='GPU Memory Utilization')
     ap.add_argument('--max-num-batched-tokens', type=int, required=True, help='Max Number of Batched Tokens')
+    ap.add_argument('--enable-prefix-caching', action='store_true', default=False,
+                    help='Enable vLLM prefix caching in the sidecar scheduler.')
     ap.add_argument('--mem-profiling-path', type=str, required=True, help='Path to the Memory Profiling Result.')
     ap.add_argument('--gpu', type=str, required=True)
 
@@ -81,6 +91,12 @@ def parse_args():
 
     # ROSS Config
     ap.add_argument('--platform-perf', type=str, required=True, help='Path to the Platform Performance file.')
+    ap.add_argument("--validate-vllm-schedule", action="store_true", default=False,
+                    help="Validate each colocate pp=1 schedule step against a vLLM sidecar scheduler.")
+    ap.add_argument("--compare-vllm-schedule", action="store_true", default=False,
+                    help="When the vLLM sidecar scheduler is enabled, compare simulator and vLLM schedule outputs step by step.")
+    ap.add_argument("--vllm-result-source", type=str, default="sim", choices=["sim", "vllm"],
+                    help="When vLLM sidecar validation is enabled, choose whether timing features come from the simulator output or the vLLM sidecar output.")
 
     ap.add_argument('--pre_forward_path', type=str, help='Path to the Saved PRE-FORWARD Model file.')
     ap.add_argument(
@@ -99,6 +115,7 @@ def parse_args():
     if not hasattr(args, "gpu_memory_utilization"):
         args.gpu_memory_utilization = args.gpu_model_utilization
     return args
+
 
 def get_ross_models(model: BaseModel,
                     platform_perf: PlatformPerf,
@@ -145,7 +162,11 @@ def get_regression_model(ross_models: Dict[str, Any], name: str, phase: str = ""
     )
 
 def get_mixed_forward_phase(schedule_output: SchedulerOutput) -> str:
-    return "prefill" if schedule_output.prefill_seq_lens else 'decode'
+    has_prefill = bool(schedule_output.prefill_seq_lens)
+    has_decode = bool(schedule_output.decode_seq_lens)
+    if has_prefill and has_decode:
+        return "forward"
+    return "prefill" if has_prefill else "decode"
 
 def update_metrics(req: Request, wall_time: float, arrive_time: float, step: int) -> bool:
     if req._last_token_time is None:
@@ -213,9 +234,21 @@ def run_simulation(
     total_gpu_memory: int | None = None,
     dp: int = 1, # vllm: p & d have same dp_size
     pp: int = 1,
+    validate_vllm_schedule: bool = False,
+    compare_vllm_schedule: bool = False,
+    vllm_src_root: str = "",
+    vllm_result_source: str = "sim",
 ) -> Dict[str, Any]:
     schedulers : List[Scheduler] = []
     total_time_slices = [{ "pre_forward": 0, "forward": 0, "post_forward": 0, "pp_pre_forward": 0 } for i in range(dp)]
+    sidecar_schedulers: List[Any] | None = None
+
+    if validate_vllm_schedule:
+        if pp != 1:
+            raise ValueError("validate_vllm_schedule currently only supports pp=1")
+        sidecar_schedulers = []
+    elif vllm_result_source != "sim":
+        raise ValueError("vllm_result_source='vllm' requires validate_vllm_schedule to be enabled")
 
     tokens_per_block = 16 if model.model_uri.lower().find('deepseek') == -1 else 64
     for idx in range(dp):
@@ -232,6 +265,25 @@ def run_simulation(
             kv_pool=kv_pool,
             **scheduler_kwargs
         ))
+        if sidecar_schedulers is not None:
+            try:
+                sidecar_schedulers.append(
+                    create_sidecar_scheduler(
+                        scheduler_kwargs=scheduler_kwargs,
+                        num_blocks=kv_pool.num_blocks,
+                        block_size=tokens_per_block,
+                        max_model_len=schedulers[-1].max_model_len,
+                        max_num_seqs=batch_size,
+                        model_uri=model.model_uri,
+                        vllm_src_root=vllm_src_root,
+                    )
+                )
+            except Exception as exc:
+                print(
+                    f"[warning] disabling vLLM schedule validation: failed to initialize sidecar scheduler: {exc}",
+                    flush=True,
+                )
+                sidecar_schedulers = None
 
     current_status = [ { "wall_time": 0.0, "step": 0, "batch_pipeline": [], "complete": False } for i in range(dp)]
     finished_reqs_count = 0
@@ -254,6 +306,16 @@ def run_simulation(
                 req = pending.popleft()
                 sched.add_request(req)
                 active_reqs_by_rank[rank][req.request_id] = req
+                if sidecar_schedulers is not None:
+                    sidecar_schedulers[rank].add_request(
+                        create_dummy_request(
+                            request_id=req.request_id,
+                            prompt_token_len=req.prompt_tokens,
+                            max_output_tokens=req.num_tokens - req.prompt_tokens,
+                            block_size=tokens_per_block,
+                            vllm_src_root=vllm_src_root,
+                        )
+                    )
             if not status["complete"]:
                 # no in-flight pipeline slots pending
                 if check_pipeline_clear(status["batch_pipeline"], status["step"], pp) and sched.should_terminate():
@@ -262,29 +324,59 @@ def run_simulation(
                         status["wall_time"] = max(status["wall_time"], req_next.ready_time)
                         sched.add_request(req_next)
                         active_reqs_by_rank[rank][req_next.request_id] = req_next
+                        if sidecar_schedulers is not None:
+                            sidecar_schedulers[rank].add_request(
+                                create_dummy_request(
+                                    request_id=req_next.request_id,
+                                    prompt_token_len=req_next.prompt_tokens,
+                                    max_output_tokens=req_next.num_tokens - req_next.prompt_tokens,
+                                    block_size=tokens_per_block,
+                                    vllm_src_root=vllm_src_root,
+                                )
+                            )
                     else:
                         status["complete"] = True
         
         for idx, scheduler in enumerate(schedulers):
             schedule_output = scheduler.schedule()
-            logger.debug(f"add to batch_pipeline; len = {len(current_status[idx]['batch_pipeline'])}, output: {schedule_output}")
+            timing_output = schedule_output
+            sidecar_output = None
+            if sidecar_schedulers is not None:
+                sidecar_output = sidecar_schedulers[idx].schedule()
+                log_sidecar_schedule(current_status[idx]["step"], idx, sidecar_output)
+                if compare_vllm_schedule:
+                    compare_schedule_outputs(
+                        current_status[idx]["step"],
+                        idx,
+                        schedule_output,
+                        sidecar_output,
+                        ross_scheduler=scheduler,
+                        sidecar_scheduler=sidecar_schedulers[idx],
+                    )
+                timing_output = choose_timing_output(
+                    schedule_output,
+                    sidecar_output,
+                    vllm_result_source,
+                    align_transfer_loaded_to_sim=False,
+                )
+            # logger.debug(f"add to batch_pipeline; len = {len(current_status[idx]['batch_pipeline'])}, output: {schedule_output}")
             current_status[idx]['batch_pipeline'].append(schedule_output)
             if schedule_output and (not scheduler.should_terminate()):
                 scheduler.debug_print_schedule(schedule_output, idx, current_status[idx]['step'])
 
                 # 2. ROSSModel Estimate Step N Finish Time
-                mixed_forward_phase = get_mixed_forward_phase(schedule_output)
+                mixed_forward_phase = get_mixed_forward_phase(timing_output)
                 for name in ['pre_forward', 'forward', 'post_forward']:
                     regression_model = get_regression_model(ross_models, name, mixed_forward_phase)
                     _time_step = regression_model.predict(
-                        req_ids=schedule_output.scheduled_req_ids,
-                        prefill_seq_lens=schedule_output.prefill_seq_lens,
-                        decode_seq_lens=schedule_output.decode_seq_lens,
+                        req_ids=timing_output.scheduled_req_ids,
+                        prefill_seq_lens=timing_output.prefill_seq_lens,
+                        decode_seq_lens=timing_output.decode_seq_lens,
                         isl=isl, osl=osl,
                     )
                     assert(_time_step >= 0)
                     total_time_slices[idx][name] += _time_step / 1000
-                    if name == 'pre_forward' and pp > 1: # pp > 1
+                    if name == 'pre_forward' and pp > 1:
                         continue
                     current_status[idx]['wall_time'] += _time_step / 1000          
                     logger.debug(f"[dp_{idx}]       {name} Time: {_time_step} ms")
@@ -296,6 +388,16 @@ def run_simulation(
                     oom, reason = scheduler.check_oom()
                     if oom:
                         raise MemoryError(f"OOM detected on rank {idx}: {reason}")
+            if (
+                sidecar_schedulers is not None
+                and sidecar_output is not None
+                and sidecar_output.total_num_scheduled_tokens > 0
+            ):
+                dummy_output = make_dummy_model_output(
+                    sidecar_schedulers[idx],
+                    sidecar_output,
+                )
+                sidecar_schedulers[idx].update_from_output(sidecar_output, dummy_output)
 
         for idx, scheduler in enumerate(schedulers):
             step = current_status[idx]["step"]
@@ -395,6 +497,7 @@ def run_sim(args):
     gpu_memory_utilization = _get_gpu_memory_utilization(args)
     scheduler_kwargs = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "enable_prefix_caching": getattr(args, "enable_prefix_caching", False),
     }
     platform_perf = PlatformPerf(platform_perf_yaml=args.platform_perf)
 
@@ -417,48 +520,31 @@ def run_sim(args):
         args.dp_size, args.disaggregation,
     )
 
-    if not args.disaggregation:
-        memory_increase = load_memory_increase(args.mem_profiling_path, { "pp": args.pp_size, "tp": args.tp_size })
-        model, ross_model_dict, _ = _init_worker_config(args)
-        ret = run_simulation(
-            model=model,
-            batch_size=args.batch_size,
-            request_list=request_store,
-            scheduler_kwargs=scheduler_kwargs,
+    if args.disaggregation:
+        raise ValueError("Disaggregated vLLM simulation must use simulator_main_aligned.py")
 
-            memory_profiling=memory_increase,
-            total_gpu_memory=platform_perf.theoretical_memory_gb * (1024 ** 3),
-            gpu_memory_utilization=gpu_memory_utilization,
+    memory_increase = load_memory_increase(args.mem_profiling_path, { "pp": args.pp_size, "tp": args.tp_size })
+    model, ross_model_dict, _ = _init_worker_config(args)
+    ret = run_simulation(
+        model=model,
+        batch_size=args.batch_size,
+        request_list=request_store,
+        scheduler_kwargs=scheduler_kwargs,
 
-            ross_models=ross_model_dict,
-            dp=args.dp_size, pp=args.pp_size,
-            isl=args.max_prompt_len, osl=args.max_output_len,
-        )
-    else:
-        prefill_memory_increase = load_memory_increase(args.mem_profiling_path, { "pp": 1, "tp": args.prefill_tp_size })
-        decode_memory_increase  = load_memory_increase(args.mem_profiling_path, { "pp": 1, "tp": args.decode_tp_size })
-        
-        prefill_model, prefill_ross_model_dict, _ = _init_worker_config(args, "prefill_")
-        decode_model, decode_ross_model_dict, _ = _init_worker_config(args, "decode_")
+        memory_profiling=memory_increase,
+        total_gpu_memory=platform_perf.theoretical_memory_gb * (1024 ** 3),
+        gpu_memory_utilization=gpu_memory_utilization,
 
-        ret = run_disagg_simulation(
-            prefill_model=prefill_model,
-            decode_model=decode_model,
-            batch_size=args.batch_size,
-            request_list=request_store,
-            scheduler_kwargs=scheduler_kwargs,
+        ross_models=ross_model_dict,
+        dp=args.dp_size, pp=args.pp_size,
+        isl=args.max_prompt_len, osl=args.max_output_len,
+        validate_vllm_schedule=getattr(args, "validate_vllm_schedule", False),
+        compare_vllm_schedule=getattr(args, "compare_vllm_schedule", False),
+        vllm_src_root=getattr(args, "vllm_src_root", ""),
+        vllm_result_source=getattr(args, "vllm_result_source", "sim"),
+    )
 
-            prefill_memory_profiling=prefill_memory_increase,
-            decode_memory_profiling=decode_memory_increase,
-            total_gpu_memory=platform_perf.theoretical_memory_gb * (1024 ** 3),
-            gpu_memory_utilization=gpu_memory_utilization,
-
-            prefill_ross_models=prefill_ross_model_dict,
-            decode_ross_models=decode_ross_model_dict,
-            dp=args.dp_size, pp=1,
-            isl=args.max_prompt_len, osl=args.max_output_len,
-        )
-
+    ret.update(scheduler_kwargs)
     ret.update({
         "gpu_memory_utilization": gpu_memory_utilization,
     })
